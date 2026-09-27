@@ -13,6 +13,7 @@ from pathlib import Path
 
 from lxml import etree
 
+from .cleanup import Cleaner
 from .config import Config
 from .epub import NCX_NS, EpubPackage, write_epub
 from .segmenter import (
@@ -99,8 +100,10 @@ def _write_txt(path: Path, segments: list[tuple[int, str]], marked: bool) -> Non
 
 
 class BookTranslator:
-    def __init__(self, cfg: Config, translator: GeminiTranslator | None, *, use_cache: bool = True):
+    def __init__(self, cfg: Config, translator: GeminiTranslator | None, *, use_cache: bool = True,
+                 clean: bool = True):
         self.cfg = cfg
+        self.clean = clean
         self.translator = translator
         self.use_cache = use_cache
 
@@ -145,7 +148,7 @@ class BookTranslator:
 
     # ------------------------------------------------------------------ main
 
-    def translate(self, epub_path: Path, *, extract_only: bool = False) -> Path | None:
+    def translate(self, epub_path: Path, *, extract_only: bool = False, clean_only: bool = False) -> Path | None:
         book = EpubPackage(epub_path)
         work = self.cfg.work_dir / slugify(epub_path.stem)
         stats = Stats()
@@ -155,49 +158,77 @@ class BookTranslator:
         replacements: dict[str, bytes] = {}
         docs = book.content_documents()
         stats.documents = len(docs)
+
+        # Phase 1: parse every document (the cleaner needs to see the whole book).
+        parsed = []
         for n, item in enumerate(docs, 1):
-            name = posixpath.basename(item.path)
-            label = f"[{n:03d}/{len(docs):03d}] {name}"
             tree, recovered = parse_xhtml(book.read(item.path))
             if recovered:
                 stats.recovered_docs.append(item.path)
                 log.warning("%s was malformed XML; repaired by the parser", item.path)
-            segs = extract_segments(tree)
+            parsed.append((n, item, tree, extract_segments(tree)))
+
+        # Phase 2: remove PDF-conversion artefacts before anything is sent to the model.
+        if self.clean:
+            cleaner = Cleaner(book.title, book.author)
+            cleaner.learn([s for *_, segs in parsed for s in segs])
+            parsed = [(n, item, tree, cleaner.clean_document(segs, item.path)) for n, item, tree, segs in parsed]
+            (work / "cleanup.txt").parent.mkdir(parents=True, exist_ok=True)
+            (work / "cleanup.txt").write_text(
+                cleaner.log.summary() + "\n\n" + "\n".join(cleaner.log.entries) + "\n", encoding="utf-8")
+            log.info("Cleanup: %s", cleaner.log.summary())
+            log.info("Cleanup details: %s", work / "cleanup.txt")
+
+        # Phase 3: per chapter TXT -> Gemini -> TXT -> XHTML.
+        for n, item, tree, segs in parsed:
+            name = posixpath.basename(item.path)
+            label = f"[{n:03d}/{len(docs):03d}] {name}"
             stem = f"{n:03d}_{Path(name).stem}"
             numbered = [(i, s.text) for i, s in enumerate(segs, 1)]
             _write_txt(work / "source" / f"{stem}.txt", numbered, marked=True)
             _write_txt(work / "source-plain" / f"{stem}.txt", numbered, marked=False)
-            if not segs:
-                log.info("%s: no text", label)
-                continue
             stats.segments += len(segs)
             if extract_only:
                 log.info("%s: %d segments extracted", label, len(segs))
                 continue
 
-            log.info("%s: %d segments", label, len(segs))
-            cache = SegmentCache(work / "cache" / f"{stem}.json", self.use_cache)
-            translations = self._translate_segments(segs, cache, label, stats)
+            if clean_only or not segs:
+                translations = {i: s.text for i, s in enumerate(segs, 1)}
+            else:
+                log.info("%s: %d segments", label, len(segs))
+                cache = SegmentCache(work / "cache" / f"{stem}.json", self.use_cache)
+                translations = self._translate_segments(segs, cache, label, stats)
 
             out_numbered = []
             for i, seg in enumerate(segs, 1):
                 dst = translations.get(i, seg.text)
                 out_numbered.append((i, dst))
-                if seg.translatable and dst.strip() == seg.text.strip() and len(_HAS_LETTERS.findall(seg.text)) > 25:
+                if clean_only:
+                    pass
+                elif seg.translatable and dst.strip() == seg.text.strip() and len(_HAS_LETTERS.findall(seg.text)) > 25:
                     stats.unchanged.append(f"{item.path}#{i}: {plain_text(seg.text)[:80]}")
                 elif seg.translatable:
                     stats.translated += 1
                 for w in apply_translation(seg, dst):
                     stats.tag_warnings.append(f"{item.path}#{i}: {w}")
             unwrap_runs(tree)
-            set_document_language(tree, self.cfg.target_code)
+            if not clean_only:
+                set_document_language(tree, self.cfg.target_code)
+                _write_txt(work / "translated" / f"{stem}.txt", out_numbered, marked=True)
+                _write_txt(work / "translated-plain" / f"{stem}.txt", out_numbered, marked=False)
             replacements[item.path] = serialize_xhtml(tree)
-            _write_txt(work / "translated" / f"{stem}.txt", out_numbered, marked=True)
-            _write_txt(work / "translated-plain" / f"{stem}.txt", out_numbered, marked=False)
 
         if extract_only:
             log.info("Extracted %d segments from %d documents into %s", stats.segments, stats.documents, work)
             return None
+        if clean_only:
+            out = self.cfg.output_dir / f"{epub_path.stem}_CLEAN.epub"
+            write_epub(book.zip, out, replacements)
+            problems = validate_epub(out, epub_path)
+            for p in problems:
+                log.error("VALIDATION: %s", p)
+            log.info("Cleaned (untranslated) EPUB: %s", out)
+            return out
 
         opf_bytes, old_uid, new_uid = book.translated_opf(self.cfg.target_code, self.cfg.target_name, self.cfg.model)
         replacements[book.opf_path] = opf_bytes

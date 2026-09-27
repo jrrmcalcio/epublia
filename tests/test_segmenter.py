@@ -81,3 +81,52 @@ def test_unclosed_wrapper_does_not_swallow_rest_of_paragraph():
     xml = serialize_xhtml(tree).decode()
     assert 'class="italic"' not in xml  # unbalanced wrapper dropped, text kept
     assert "Hola valiente mundo.<br/>Siguiente línea <img" in xml
+
+
+# ----------------------------------------------------------------------------- cleanup
+
+from epublia.cleanup import Cleaner  # noqa: E402
+
+PDF_DOC = """<?xml version='1.0' encoding='utf-8'?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<p class="p">It was a mere drop in <br class="b"/> 2 <span class="h">JANE DOE </span></p>
+<p class="p">the vast ocean. He had done <br class="b"/> to get inside. He did not care about the <br class="b"/> Marines at all, that's how I <br class="b"/> wanted it.<br class="b"/>- 14 -<br class="b"/>Then it
+ended. The ﬁnal thing was sepa- rate, but pre- and post-war stayed. OceanofPDF.com<br class="b"/>Wait . . . what?</p>
+<h1>12</h1><p>Contents<br/>The First Part<br/>the second part</p></body></html>"""
+
+
+def _cleaned(doc=PDF_DOC):
+    tree, _ = parse_xhtml(doc.encode())
+    segs = extract_segments(tree)
+    cl = Cleaner("Some Title", "Jane Doe")
+    cl.learn(segs)
+    segs = cl.clean_document(segs, "doc")
+    for s in segs:
+        apply_translation(s, s.text)
+    unwrap_runs(tree)
+    return serialize_xhtml(tree).decode(), cl.log
+
+
+def test_cleanup_removes_pdf_artefacts():
+    xml, log = _cleaned()
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", xml))
+    assert "JANE DOE" not in xml and "- 14 -" not in xml and "OceanofPDF" not in xml
+    assert "a mere drop in the vast ocean" in text          # split paragraph merged
+    assert "had done to get inside" in text                  # broken line joined
+    assert "about the Marines" in text and "how I wanted" in text
+    assert 'class="h"' not in xml                            # header wrapper removed, not left empty
+    assert "final thing was separate" in text                # ligature + hyphenation
+    assert "pre- and post-war" in text                       # real suspended hyphen kept
+    assert "Wait . . . what?" in text                        # spaced ellipsis untouched
+    assert "<h1>12</h1>" in xml                              # numeric headings kept
+    assert "Contents<br/>The First Part" in xml              # short lines never glued
+    assert log.headers == 1 and log.page_numbers == 1 and log.watermarks == 1
+    assert log.paragraph_merges == 1
+
+
+def test_page_number_variants():
+    from epublia.cleanup import _PAGE_NO
+    for ok in ("12", "- 12 -", "[12]", "Page 12", "p. 12", "Página 7", "12 of 300", "12 / 300", "xii", "iv"):
+        assert _PAGE_NO.match(ok), ok
+    for no in ("I", "mix", "12 monkeys", "Chapter 12", "civil"):
+        assert not _PAGE_NO.match(no), no

@@ -29,6 +29,8 @@ epublia christie golden                    # todas las palabras deben aparecer e
 epublia C:\ruta\a\libro.epub               # ruta directa
 epublia firstborn --list                   # solo muestra qué libros coinciden
 epublia firstborn --extract-only           # solo extrae los TXT por capítulo (sin API)
+epublia firstborn --clean-only             # solo limpia basura de PDF -> <nombre>_CLEAN.epub (sin API)
+epublia firstborn --no-clean               # traduce sin limpieza previa
 epublia firstborn --lang FR                # otro idioma sin tocar el .env
 epublia firstborn --no-cache               # vuelve a traducir todo
 ```
@@ -46,16 +48,39 @@ El libro traducido queda en `books-outputs/<nombre>_<IDIOMA>.epub`.
 1. Lee el EPUB (OPF, spine, manifest, NCX) y recorre cada documento XHTML en orden de lectura.
 2. Divide cada capítulo en segmentos (párrafos, títulos, texto suelto). El formato inline se
    sustituye por marcadores `<x1>…</x1>` / `<x2/>` para que el modelo pueda moverlo con las palabras.
-3. Escribe `work/<libro>/source/NNN_capitulo.txt` (con marcadores `[[n]]`) y `source-plain/` (texto limpio).
-4. Envía cada capítulo a Gemini (agrupando hasta `MAX_CHARS_PER_REQUEST` caracteres por petición),
+3. **Limpia la basura de conversión PDF** (ver abajo) y registra cada cambio en `work/<libro>/cleanup.txt`.
+4. Escribe `work/<libro>/source/NNN_capitulo.txt` (con marcadores `[[n]]`) y `source-plain/` (texto limpio).
+5. Envía cada capítulo a Gemini (agrupando hasta `MAX_CHARS_PER_REQUEST` caracteres por petición),
    con throttling de `GEMINI_RPM` peticiones/minuto y reintentos con backoff ante 429/5xx.
-5. Guarda la traducción en `translated/` y `translated-plain/`, y en una caché por capítulo que permite
+6. Guarda la traducción en `translated/` y `translated-plain/`, y en una caché por capítulo que permite
    **reanudar** si se corta la conexión o se agota la cuota diaria (vuelve a ejecutar el mismo comando).
-6. Reconstruye el EPUB copiando byte a byte todo lo que no es texto (imágenes, CSS, fuentes), cambia
+7. Reconstruye el EPUB copiando byte a byte todo lo que no es texto (imágenes, CSS, fuentes), cambia
    `dc:language`, `xml:lang`, el índice (NCX) y da al libro un identificador nuevo para que el lector
    no lo confunda con el original.
-7. Valida el resultado (XML bien formado, mismas imágenes/enlaces/tablas, recursos intactos) y genera
+8. Valida el resultado (XML bien formado, mismas imágenes/enlaces/tablas, recursos intactos) y genera
    `work/<libro>/report.json` con segmentos posiblemente sin traducir y avisos de formato.
+
+## Limpieza de basura de PDF
+
+Muchos EPUB vienen de PDFs convertidos. Antes de traducir, epublia elimina o corrige:
+
+| Problema | Ejemplo | Acción |
+|---|---|---|
+| Encabezados/pies de página | `2 CHRISTIE GOLDEN`, `FIRSTBORN 3` | Se eliminan (título/autor + número, o línea numerada que se repite ≥3 veces) |
+| Encabezados repetidos en mayúsculas | `CHAPTER ONE` en cada página | Se eliminan si aparecen ≥5 veces a mitad de párrafo |
+| Números de página sueltos | `12`, `- 12 -`, `[12]`, `Page 12`, `12 of 300`, `xii` | Se eliminan (nunca en títulos `<h1>`…) |
+| Marcas de agua | `OceanofPDF.com`, "Scanned by…", "This page intentionally left blank" | Se eliminan |
+| Líneas cortadas a mitad de oración | `had done ⏎ to get inside` | Se unen |
+| Párrafos partidos | `</p><p>` seguido de minúscula | Se fusionan |
+| Palabras con guion de corte | `some- ⏎ thing`, `sepa- rate` | Se unen (respeta `pre- and post-war`) |
+| Ligaduras y caracteres invisibles | `ﬁ ﬂ ﬀ`, soft hyphen, zero-width | Se normalizan |
+| Letras espaciadas | `C H A P T E R` | Se unen |
+| Espacio antes de puntuación | `word ,` | Se corrige (respeta `. . .`) |
+| Notas al pie de PDF incrustadas | `1 See the appendix…` a mitad de párrafo | **Solo se reportan** en `cleanup.txt`: no se pueden distinguir con seguridad del texto |
+
+Las notas al pie reales de EPUB (enlaces/`noteref`) se conservan y se traducen. Revisa
+`work/<libro>/cleanup.txt` y, si quieres ver el resultado sin gastar cuota, usa `--clean-only`.
+Se desactiva con `--no-clean` o `CLEANUP=false`.
 
 ## Free tier de Gemini
 
@@ -76,8 +101,7 @@ Para mantener nombres y términos consistentes entre capítulos, crea un archivo
 
 - EPUB con DRM no se pueden traducir (se detecta y se avisa).
 - No se traduce texto dentro de imágenes, SVG, `<pre>`/`<code>` ni el título en los metadatos.
-- EPUB convertidos desde PDF pueden traer cabeceras de página sueltas ("2 CHRISTIE GOLDEN"); se
-  traducen tal cual porque forman parte del texto original.
+- La limpieza es heurística y conservadora: prefiere dejar un artefacto a borrar texto de la historia.
 
 ## Tests
 

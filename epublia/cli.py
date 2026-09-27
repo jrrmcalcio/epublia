@@ -84,6 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lang", help="override TARGET_LANGUAGE (e.g. ES, FR, pt-br)")
     ap.add_argument("--model", help="override GEMINI_MODEL")
     ap.add_argument("--extract-only", action="store_true", help="only extract per-chapter TXT files, no API calls")
+    ap.add_argument("--clean-only", action="store_true",
+                    help="only remove PDF artefacts and write <name>_CLEAN.epub (no API calls)")
+    ap.add_argument("--no-clean", action="store_true", help="skip PDF-artefact cleanup (also CLEANUP=false)")
     ap.add_argument("--no-cache", action="store_true", help="ignore cached translations and translate again")
     ap.add_argument("--list", action="store_true", help="list matching books and exit")
     ap.add_argument("--check", action="store_true", help="verify API key/model with one tiny request")
@@ -99,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["TARGET_LANGUAGE"] = args.lang
     if args.model:
         os.environ["GEMINI_MODEL"] = args.model
-    needs_key = args.check or not (args.extract_only or args.list)
+    needs_key = args.check or not (args.extract_only or args.list or args.clean_only)
     try:
         cfg = load_config(require_key=needs_key)
     except ConfigError as exc:
@@ -128,17 +131,18 @@ def main(argv: list[str] | None = None) -> int:
     from .translator import GeminiTranslator
 
     translator = None
-    if not args.extract_only:
+    if not (args.extract_only or args.clean_only):
         limiter = RateLimiter(cfg.rpm, cfg.rpd, cfg.work_dir / ".quota.json")
         translator = GeminiTranslator(cfg, limiter)
         log.info("Model %s -> %s | throttle %d req/min%s", cfg.model, cfg.target_name, cfg.rpm,
                  f", {cfg.rpd} req/day" if cfg.rpd else "")
-    bt = BookTranslator(cfg, translator, use_cache=not args.no_cache)
+    clean = not args.no_clean and os.getenv("CLEANUP", "true").strip().lower() not in ("0", "false", "no", "off")
+    bt = BookTranslator(cfg, translator, use_cache=not args.no_cache, clean=clean)
 
     failures = 0
     for book in books:
         try:
-            bt.translate(book, extract_only=args.extract_only)
+            bt.translate(book, extract_only=args.extract_only, clean_only=args.clean_only)
         except DailyLimitReached as exc:
             log.error("%s", cfg.redact(str(exc)))
             log.error("Progress is saved. Run the same command again after the quota resets to resume.")
