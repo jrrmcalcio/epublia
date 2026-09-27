@@ -112,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="only remove PDF artefacts and write <name>_CLEAN.epub (no API calls)")
     ap.add_argument("--no-clean", action="store_true", help="skip PDF-artefact cleanup (also CLEANUP=false)")
     ap.add_argument("--no-cache", action="store_true", help="ignore cached translations and translate again")
+    ap.add_argument("--no-repair", action="store_true",
+                    help="keep the source markup errors as they are (also REPAIR=false)")
     ap.add_argument("--dry-run", action="store_true",
                     help="show what would be translated, requests needed and name issues (no API calls)")
     ap.add_argument("--glossary-only", action="store_true",
@@ -143,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["GEMINI_MODEL"] = args.model
     if args.series:
         os.environ["SERIES"] = args.series
+    if args.no_repair:
+        os.environ["REPAIR"] = "false"
     if args.init:
         from .config import ROOT
         for d in ("books-input", "books-outputs"):

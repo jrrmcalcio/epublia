@@ -80,6 +80,7 @@ class Config:
     fallback_rpd: int = 0
     series: str = ""
     epubcheck: str = ""  # path to epubcheck.jar ("" = auto-detect, "off" = disabled)
+    repair: bool = True  # fix validity errors the source EPUB already had
 
     @property
     def fallback_enabled(self) -> bool:
@@ -139,4 +140,5 @@ def load_config(require_key: bool = True) -> Config:
         fallback_rpd=max(0, _int("FALLBACK_RPD", 0)),
         series=os.getenv("SERIES", "").strip(),
         epubcheck=os.getenv("EPUBCHECK_JAR", "").strip(),
+        repair=os.getenv("REPAIR", "true").strip().lower() not in ("0", "false", "no", "off"),
     )

@@ -8,6 +8,7 @@ import posixpath
 import re
 import time
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from .cleanup import Cleaner
 from .config import ROOT, Config
 from .epub import NCX_NS, EpubPackage, write_epub
 from .glossary import Glossary, find_candidates, merge
+from .repair import repair_document, repair_ncx
 from .segmenter import (
     _HAS_LETTERS,
     Segment,
@@ -57,6 +59,7 @@ class Stats:
     incomplete: list[str] = field(default_factory=list)
     fallback: list[str] = field(default_factory=list)
     renamed: int = 0  # cached segments re-translated because they broke the glossary
+    repairs: Counter = field(default_factory=Counter)  # source validity errors fixed, by kind
     pending: int = 0
     pending_chars: int = 0
     planned_requests: int = 0
@@ -476,6 +479,8 @@ class BookTranslator:
                 if self.bilingual and not clean_only and seg.translatable and dst.strip() != seg.text.strip():
                     add_original(seg, seg.text)
             unwrap_runs(tree)
+            if self.cfg.repair:
+                stats.repairs.update(repair_document(tree, book.version))
             if not clean_only:
                 set_document_language(tree, self.cfg.target_code)
                 _write_txt(work / "translated" / f"{stem}.txt", out_numbered, marked=True)
@@ -528,6 +533,8 @@ class BookTranslator:
         parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=True)
         ncx = etree.fromstring(book.read(book.ncx_path), parser)
         ncx.set("{http://www.w3.org/XML/1998/namespace}lang", self.cfg.target_code)
+        if self.cfg.repair:
+            stats.repairs.update(repair_ncx(ncx))
         doc_title = ncx.find(f"{{{NCX_NS}}}docTitle/{{{NCX_NS}}}text")
         if title and doc_title is not None:
             doc_title.text = title
@@ -595,6 +602,7 @@ class BookTranslator:
             "retranslated_for_names": stats.renamed,
             "name_consistency_issues": stats.name_issues,
             "translated_by_backup_model": stats.fallback,
+            "markup_repairs": dict(stats.repairs),
             "malformed_source_documents": stats.recovered_docs,
             "validation_problems": problems,
             "epubcheck": checked if checked is not None else "not run (install Java + epubcheck --install-epubcheck)",
@@ -611,6 +619,12 @@ class BookTranslator:
         if checked is not None:
             log.info("EPUBCheck: %d new error(s), %d new warning(s) (%d already in the original)",
                      len(checked["new_errors"]), len(checked["new_warnings"]), checked["preexisting_messages"])
+            if checked.get("fixed_from_original"):
+                log.info("EPUBCheck: %d problem(s) of the original are gone in the translation",
+                         checked["fixed_from_original"])
+        if stats.repairs:
+            log.info("Repaired source markup: %s",
+                     ", ".join(f"{n}x {kind}" for kind, n in stats.repairs.most_common()))
             for w in checked["new_warnings"]:
                 log.warning("EPUBCheck: %s", w)
         if problems:

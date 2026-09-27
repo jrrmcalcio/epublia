@@ -82,6 +82,8 @@ def new_problems(cmd: list[str], original: Path, output: Path) -> dict | None:
 
     known = {key(m) for m in before}
     added = [m for m in after if key(m) not in known]
+    remaining = {key(m) for m in after}
+    fixed = sum(1 for m in before if key(m) not in remaining)
 
     def fmt(m):
         return f"{m['severity']} {m['id']} {m['path']}:{m['line']} {m['message']}"
@@ -90,6 +92,7 @@ def new_problems(cmd: list[str], original: Path, output: Path) -> dict | None:
         "new_errors": [fmt(m) for m in added if m["severity"] in ("ERROR", "FATAL")],
         "new_warnings": [fmt(m) for m in added if m["severity"] == "WARNING"],
         "preexisting_messages": len(before),
+        "fixed_from_original": fixed,
     }
 
 

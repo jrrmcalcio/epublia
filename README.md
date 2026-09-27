@@ -12,6 +12,9 @@ byte-identical, and that is verified on every run.
 - **Robust on messy books**: PDF-conversion artefacts are cleaned before translating, very long
   paragraphs are sent in sentence-aligned parts, passages the model refuses are retried in halves
   and, optionally, sent to a backup model (any OpenAI-compatible API).
+- **Comes out cleaner than it went in**: common validity errors of the source EPUB (images without
+  `alt`, loose text in `<body>`, blocks inside inline elements, invalid NCX ids) are repaired
+  without changing how the book looks.
 - **Checks its own output**: untranslated or incomplete passages, broken inline tags, structural
   validation and, if Java is available, W3C EPUBCheck (only problems *added* by the translation are
   reported).
@@ -70,6 +73,7 @@ epublia firstborn --extract-only           # only write the per-chapter TXT file
 epublia firstborn --clean-only             # only remove PDF artefacts -> <name>_CLEAN.epub (no API)
 epublia firstborn --no-clean               # translate without the PDF cleanup
 epublia firstborn --no-cache               # translate everything again
+epublia firstborn --no-repair              # keep the source's markup errors as they are
 epublia --install-epubcheck                # download W3C EPUBCheck into tools/ (needs Java)
 ```
 
@@ -213,6 +217,23 @@ added (many retail EPUBs already carry errors of their own). Setup:
 
 `EPUBCHECK_JAR` can point at another jar, or be `off` to skip the check.
 
+## Repairing the source's errors
+
+Many retail and converted EPUBs fail validation. epublia repairs the common cases in the
+translated book (the original file is never touched), choosing fixes that render the same:
+
+| Source error | Repair |
+|---|---|
+| `<img>` without `alt` | `alt=""` (what readers assume for a decorative image) |
+| Text or inline elements directly in `<body>`/`<blockquote>` (EPUB 2 / XHTML 1.1) | Wrapped in a `<div>`, which is how readers already lay them out |
+| Block element inside an inline one (`<span><p>…</p></span>`) or inside a `<p>` | The wrapper becomes a `<div>` with the same attributes |
+| Empty `<body>` (EPUB 2) | Gets an empty `<div>` |
+| NCX ids that are not valid XML names (`id="1"`) | Renamed (`np_1`); NCX ids are not referenced elsewhere |
+
+Only markup changes, never text or resources. The repairs are counted in `report.json`
+(`markup_repairs`), and when EPUBCheck runs it also reports how many of the original's problems
+are gone. Disable with `--no-repair` or `REPAIR=false`.
+
 ## PDF artefact cleanup
 
 Many EPUBs are converted PDFs. Before translating, epublia removes or fixes:
@@ -267,6 +288,7 @@ Settings are read from `.env` (see `.env.example` for a commented template):
 | `FALLBACK_BASE_URL` / `FALLBACK_API_KEY` / `FALLBACK_MODEL` | — | Backup model (OpenAI-compatible API) |
 | `FALLBACK_RPM` / `FALLBACK_RPD` | `10` / `0` | Backup model throttling |
 | `EPUBCHECK_JAR` | auto-detect | EPUBCheck jar path, or `off` |
+| `REPAIR` | `true` | Repair validity errors the source EPUB already had |
 | `INPUT_DIR` / `OUTPUT_DIR` / `WORK_DIR` | `books-input` / `books-outputs` / `work` | Folders, relative to `EPUBLIA_HOME` |
 
 ## Limitations
@@ -292,7 +314,7 @@ Releases are published to PyPI by `.github/workflows/publish.yml` using PyPI tru
 
 1. Once, on <https://pypi.org/manage/account/publishing/>, add a pending publisher: project
    `epublia`, owner `jrrmcalcio`, repository `epublia`, workflow `publish.yml`, environment `pypi`.
-2. Bump `__version__` in `epublia/__init__.py`, commit, then `git tag v0.2.0 && git push --tags`.
+2. Bump `__version__` in `epublia/__init__.py`, commit, then `git tag v0.3.0 && git push --tags`.
 
 ## License
 
