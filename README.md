@@ -33,6 +33,9 @@ epublia firstborn --clean-only             # solo limpia basura de PDF -> <nombr
 epublia firstborn --no-clean               # traduce sin limpieza previa
 epublia firstborn --lang FR                # otro idioma sin tocar el .env
 epublia firstborn --no-cache               # vuelve a traducir todo
+epublia firstborn --dry-run                # qué se traduciría, cuántas peticiones y problemas de nombres (sin API)
+epublia firstborn --glossary-only          # genera el glosario del libro y para, para revisarlo antes
+epublia firstborn --fix-names              # retraduce solo los segmentos que no respetan el glosario
 ```
 
 `epublia` es `.\epublia.bat` (PowerShell/cmd) o `./epublia.sh` (bash); también sirve
@@ -50,15 +53,24 @@ El libro traducido queda en `books-outputs/<nombre>_<IDIOMA>.epub`.
    sustituye por marcadores `<x1>…</x1>` / `<x2/>` para que el modelo pueda moverlo con las palabras.
 3. **Limpia la basura de conversión PDF** (ver abajo) y registra cada cambio en `work/<libro>/cleanup.txt`.
 4. Escribe `work/<libro>/source/NNN_capitulo.txt` (con marcadores `[[n]]`) y `source-plain/` (texto limpio).
-5. Envía cada capítulo a Gemini (agrupando hasta `MAX_CHARS_PER_REQUEST` caracteres por petición),
-   con throttling de `GEMINI_RPM` peticiones/minuto y reintentos con backoff ante 429/5xx.
-6. Guarda la traducción en `translated/` y `translated-plain/`, y en una caché por capítulo que permite
-   **reanudar** si se corta la conexión o se agota la cuota diaria (vuelve a ejecutar el mismo comando).
-7. Reconstruye el EPUB copiando byte a byte todo lo que no es texto (imágenes, CSS, fuentes), cambia
+5. Genera el **glosario** del libro la primera vez (ver [Coherencia de nombres](#coherencia-de-nombres)).
+6. Envía cada capítulo a Gemini (agrupando hasta `MAX_CHARS_PER_REQUEST` caracteres por petición),
+   con el glosario aplicable y el pasaje anterior como contexto, throttling de `GEMINI_RPM`
+   peticiones/minuto y reintentos con backoff ante 429/5xx. Los párrafos muy largos (típicos de
+   PDFs convertidos) se envían en trozos de hasta `SEGMENT_SPLIT_CHARS` cortados en fin de frase.
+   Si Gemini bloquea o se salta un segmento, se reintenta en mitades para que solo quede sin
+   traducir el fragmento problemático.
+7. Guarda la traducción en `work/<libro>/<idioma>/` (`translated/`, `translated-plain/` y una caché
+   por capítulo) que permite **reanudar** si se corta la conexión o se agota la cuota diaria. Cada
+   idioma tiene su propia caché y glosario.
+8. Reconstruye el EPUB copiando byte a byte todo lo que no es texto (imágenes, CSS, fuentes), cambia
    `dc:language`, `xml:lang`, el índice (NCX) y da al libro un identificador nuevo para que el lector
-   no lo confunda con el original.
-8. Valida el resultado (XML bien formado, mismas imágenes/enlaces/tablas, recursos intactos) y genera
-   `work/<libro>/report.json` con segmentos posiblemente sin traducir y avisos de formato.
+   no lo confunda con el original. Si el modelo olvida cerrar una etiqueta de formato, se cierra
+   donde terminaba en el original.
+9. Valida el resultado (XML bien formado, mismas imágenes/enlaces/tablas, recursos intactos) y genera
+   `work/<libro>/<idioma>/report.json` con segmentos sin traducir, **posiblemente incompletos**
+   (mucho más cortos que el original o con frases aún en el idioma original), problemas de nombres
+   y avisos de formato. Los dudosos se muestran también en la consola como `CHECK:`.
 
 ## Limpieza de basura de PDF
 
@@ -92,10 +104,46 @@ Se desactiva con `--no-clean` o `CLEANUP=false`.
   activa, Google cobra por uso. La API no permite comprobarlo desde el código.
 - En el free tier Google puede usar el contenido enviado para mejorar sus productos.
 
-## Glosario (opcional)
+## Coherencia de nombres
 
-Para mantener nombres y términos consistentes entre capítulos, crea un archivo (ver
-`glossary.example.txt`) y apúntalo con `GLOSSARY_FILE=glossary.txt` en el `.env`.
+Cada capítulo se traduce en peticiones separadas, así que sin ayuda el modelo puede escribir
+`Tigre Gris` en un capítulo y `Gray Tiger` en otro. epublia lo evita de tres formas:
+
+1. **Glosario automático.** Antes de traducir, busca en el libro (sin API) los nombres propios y
+   términos inventados que se repiten y pide al modelo, en 1–2 peticiones, cómo traducir cada uno.
+   El resultado queda en `work/<libro>/<idioma>/glossary.txt`, editable, y no se regenera mientras exista
+   (bórralo para crear uno nuevo). Los candidatos brutos están en `glossary-candidates.txt`.
+   Cada petición incluye solo las entradas que aparecen en sus segmentos.
+2. **Contexto.** Cada petición lleva el final del pasaje anterior ya traducido (`CONTEXT_CHARS`,
+   1500 por defecto; `0` lo desactiva) para mantener nombres, tono y tratamientos (tú/usted).
+3. **Revisión.** Tras cada ejecución, `work/<libro>/<idioma>/names.txt` (y `report.json`) lista los segmentos
+   que no respetan el glosario: traducción distinta o mayúsculas incoherentes (`los shelak` frente
+   a `los Shelak`). `--fix-names` retraduce solo esos segmentos. Si la nueva versión sale peor
+   (bloqueada, incompleta o con más fallos), se conserva la anterior.
+
+Formato del glosario (una regla por línea, `#` para comentarios):
+
+```
+Gray Tiger = Tigre Gris
+Preserver = Preservador | Preservadora    # alternativas según género/número
+Shelak = Shelak
+```
+
+Para reglas que valgan para todos tus libros, crea un archivo (ver `glossary.example.txt`) y
+apúntalo con `GLOSSARY_FILE=glossary.txt` en el `.env`: sus entradas prevalecen sobre las del
+glosario automático. `AUTO_GLOSSARY=false` desactiva la generación automática.
+
+Todo es automático: `epublia libro` genera el glosario (si no existe) y traduce en una sola
+ejecución. Si prefieres revisar el glosario antes de gastar la cuota de la traducción:
+
+```bash
+epublia libro --dry-run          # coste estimado
+epublia libro --glossary-only    # 1–2 peticiones; revisa work/<libro>/<idioma>/glossary.txt
+epublia libro                    # traduce
+```
+
+Para un libro ya traducido: `--glossary-only`, revisa el glosario, `--dry-run --fix-names` para ver
+el coste y después `--fix-names`.
 
 ## Limitaciones
 

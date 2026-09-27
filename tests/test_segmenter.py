@@ -76,11 +76,25 @@ def test_find_books_by_word(tmp_path):
 def test_unclosed_wrapper_does_not_swallow_rest_of_paragraph():
     tree, _ = parse_xhtml(DOC)
     seg = next(s for s in extract_segments(tree) if s.text.startswith("Hello"))
-    apply_translation(seg, "Hola <x1>valiente mundo.<x2/>Siguiente</x9> línea <x3/> fin.")
+    warnings = apply_translation(seg, "Hola <x1>valiente mundo.<x2/>Siguiente</x9> línea <x3/> fin.")
     unwrap_runs(tree)
     xml = serialize_xhtml(tree).decode()
-    assert 'class="italic"' not in xml  # unbalanced wrapper dropped, text kept
-    assert "Hola valiente mundo.<br/>Siguiente línea <img" in xml
+    # The missing </x1> is restored where the original span ended (before the <br/>, which was
+    # not inside it); the stray </x9> is dropped and the rest of the paragraph stays plain.
+    assert 'Hola <span class="italic">valiente mundo.</span><br/>Siguiente línea <img' in xml
+    assert warnings
+
+
+def test_unclosed_tag_is_closed_after_its_own_descendants():
+    doc = (b'<html xmlns="http://www.w3.org/1999/xhtml"><body><p>A <i>one<br/>two</i> and '
+           b'<b>bold</b> end.</p></body></html>')
+    tree, _ = parse_xhtml(doc)
+    seg = extract_segments(tree)[0]
+    assert seg.text == "A <x1>one<x2/>two</x1> and <x3>bold</x3> end."
+    warnings = apply_translation(seg, "Un <x1>uno<x2/>dos y <x3>negrita</x3> fin.")
+    assert warnings and "restored" in warnings[0]
+    xml = serialize_xhtml(tree).decode()
+    assert "<p>Un <i>uno<br/>dos y </i><b>negrita</b> fin.</p>" in xml
 
 
 # ----------------------------------------------------------------------------- cleanup

@@ -10,12 +10,43 @@ from google import genai
 from google.genai import errors, types
 
 from .config import Config
+from .glossary import Glossary
 from .rate_limiter import DailyLimitReached, RateLimiter
 
 log = logging.getLogger("epublia")
 
 MARKER = re.compile(r"^\s*\[\[(\d+)\]\]\s?", re.MULTILINE)
 MAX_ATTEMPTS = 6
+_TAG = re.compile(r"<(/?)x\d+(/?)>")
+_SENTENCE_END = re.compile(r"[.!?…][\"”’»)]*\s+")
+MIN_SPLIT = 800  # a blocked/missing segment shorter than this is kept as is
+
+
+def split_text(text: str, limit: int) -> list[str]:
+    """Split placeholder text into pieces of about ``limit`` chars at sentence ends that are not
+    inside an inline tag, so every piece keeps balanced <xN>…</xN> pairs. Rejoin with a space."""
+    if len(text) <= limit:
+        return [text]
+    depth, tags, cuts = 0, list(_TAG.finditer(text)), []
+    t = 0
+    for m in _SENTENCE_END.finditer(text):
+        while t < len(tags) and tags[t].start() < m.end():
+            closing, void = tags[t].group(1) == "/", tags[t].group(2) == "/"
+            depth += 0 if void else (-1 if closing else 1)
+            t += 1
+        if depth == 0 and m.end() < len(text):
+            cuts.append(m.end())
+    pieces, start = [], 0
+    while len(text) - start > limit:
+        fitting = [c for c in cuts if start < c <= start + limit]
+        later = [c for c in cuts if c > start]
+        cut = fitting[-1] if fitting else (later[0] if later else None)
+        if cut is None:
+            break
+        pieces.append(text[start:cut].strip())
+        start = cut
+    pieces.append(text[start:].strip())
+    return [p for p in pieces if p]
 
 
 class TranslationError(Exception):
@@ -44,7 +75,29 @@ Rules:
   only translate them when an established {language} translation exists.
 - If a segment is only a number, URL, ISBN, code or a name, return it unchanged.
 - If the source text is in ALL CAPS as a stylistic chapter opening, keep the same style.
-{glossary}"""
+- The message may start with a GLOSSARY: always use those renderings (with the same capitalisation;
+  where alternatives are given with "|", pick the one that fits gender/number). It may also include a
+  PREVIOUS PASSAGE, already translated, only so you keep names, tone and forms of address
+  consistent; never output it. Only output the marked segments after "SEGMENTS:"."""
+
+GLOSSARY_PROMPT = """You prepare the terminology sheet for a {language} translation of a book.
+You receive candidate terms extracted automatically, one per line: "term (count): example context".
+
+Return ONLY lines of the form
+  term = rendering
+for every term that is a proper name, place, ship, organisation, species, tribe, title, rank or
+invented concept whose rendering must stay identical across the book. Skip ordinary words,
+exclamations and oaths (God, Hell, Lord...), forms of address that depend on context (Sir, Master,
+Your Excellency), sentence fragments and publishing boilerplate (publisher, ISBN, addresses).
+
+Rules for the rendering:
+- Keep personal names unchanged. Translate descriptive names, titles and invented concepts only when
+  a {language} edition would (use the established official translation of the franchise if one exists).
+- Give the capitalisation to use mid-sentence, following {language} conventions (e.g. Spanish writes
+  demonyms and species in lowercase unless they are used as proper names).
+- If gender or number changes the form, list the alternatives separated by " | ",
+  e.g. "Preserver = Preservador | Preservadora".
+- One line per term, no numbering, no commentary, no code fences."""
 
 
 class GeminiTranslator:
@@ -58,17 +111,14 @@ class GeminiTranslator:
                 retry_options=types.HttpRetryOptions(attempts=1),  # we retry ourselves (quota-aware)
             ),
         )
-        glossary = ""
-        if cfg.glossary:
-            glossary = "\nGlossary (always use these renderings):\n" + cfg.glossary + "\n"
-        self.system_prompt = SYSTEM_PROMPT.format(language=cfg.target_name, glossary=glossary)
+        self.system_prompt = SYSTEM_PROMPT.format(language=cfg.target_name)
         self.requests_made = 0
 
     # ------------------------------------------------------------------ API
 
-    def _gen_config(self) -> types.GenerateContentConfig:
+    def _gen_config(self, system: str | None = None) -> types.GenerateContentConfig:
         kwargs = dict(
-            system_instruction=self.system_prompt,
+            system_instruction=system or self.system_prompt,
             temperature=self.cfg.temperature,
             max_output_tokens=65_536,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
@@ -98,14 +148,14 @@ class GeminiTranslator:
         text = (str(getattr(err, "details", "") or "") + str(getattr(err, "message", "") or "")).lower()
         return "perday" in text or "per_day" in text or "requests per day" in text
 
-    def call(self, prompt: str) -> str:
+    def call(self, prompt: str, system: str | None = None) -> str:
         last: Exception | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             self.limiter.acquire()
             self.requests_made += 1
             try:
                 resp = self.client.models.generate_content(
-                    model=self.cfg.model, contents=prompt, config=self._gen_config()
+                    model=self.cfg.model, contents=prompt, config=self._gen_config(system)
                 )
             except errors.APIError as err:
                 msg = self.cfg.redact(f"{err.code} {err.status}: {err.message}")
@@ -150,8 +200,19 @@ class GeminiTranslator:
     # ------------------------------------------------------------------ segments
 
     @staticmethod
-    def build_prompt(items: list[tuple[int, str]]) -> str:
-        return "\n".join(f"[[{i}]] {t}" for i, t in items)
+    def build_prompt(items: list[tuple[int, str]], glossary: str = "",
+                     context: list[tuple[str, str]] | None = None) -> str:
+        segments = "\n".join(f"[[{i}]] {t}" for i, t in items)
+        if not glossary and not context:
+            return segments
+        parts = []
+        if glossary:
+            parts.append("GLOSSARY:\n" + glossary)
+        if context:
+            parts.append("PREVIOUS PASSAGE (context only, do not output):\n"
+                         + "\n".join(f"SOURCE: {s}\nTRANSLATION: {t}" for s, t in context))
+        parts.append("SEGMENTS:\n" + segments)
+        return "\n\n".join(parts)
 
     @staticmethod
     def parse_response(text: str) -> dict[int, str]:
@@ -163,20 +224,24 @@ class GeminiTranslator:
             out[int(m.group(1))] = " ".join(text[m.end():end].split())
         return out
 
-    def translate_items(self, items: list[tuple[int, str]]) -> dict[int, str]:
+    def translate_items(self, items: list[tuple[int, str]], glossary: Glossary | None = None,
+                        context: list[tuple[str, str]] | None = None) -> dict[int, str]:
         """Translate [(id, text)] and return {id: translation}. Items that the model keeps
-        blocking are returned untranslated (and reported by the caller as untranslated)."""
+        blocking are returned untranslated (and reported by the caller as untranslated).
+        Only the glossary entries that occur in ``items`` are sent; ``context`` is the preceding
+        (source, translation) text, sent for continuity."""
         if not items:
             return {}
+        block = glossary.prompt_block("\n".join(t for _, t in items)) if glossary else ""
         try:
-            result = self.parse_response(self.call(self.build_prompt(items)))
+            result = self.parse_response(self.call(self.build_prompt(items, block, context)))
         except BlockedError as exc:
             if len(items) == 1:
-                log.warning("segment %d could not be translated (%s); keeping original", items[0][0], exc)
-                return {items[0][0]: items[0][1]}
+                return self._split_single(items[0], glossary, context, str(exc))
             log.warning("request blocked/truncated (%s); splitting %d segments in half", exc, len(items))
             mid = len(items) // 2
-            return {**self.translate_items(items[:mid]), **self.translate_items(items[mid:])}
+            return {**self.translate_items(items[:mid], glossary, context),
+                    **self.translate_items(items[mid:], glossary, context)}
 
         wanted = {i for i, _ in items}
         missing = [(i, t) for i, t in items if not result.get(i)]
@@ -185,10 +250,46 @@ class GeminiTranslator:
             result.pop(k, None)
         if missing:
             if len(missing) == len(items) and len(items) == 1:
-                log.warning("segment %d missing from response; keeping original", items[0][0])
-                return {items[0][0]: items[0][1]}
+                return self._split_single(items[0], glossary, context, "missing from response")
             log.info("%d segment(s) missing from response, re-requesting them", len(missing))
-            result.update(self.translate_items(missing) if len(missing) < len(items) else
-                          {**self.translate_items(missing[: len(missing) // 2]),
-                           **self.translate_items(missing[len(missing) // 2:])})
+            half = len(missing) // 2
+            result.update(self.translate_items(missing, glossary, context) if len(missing) < len(items) else
+                          {**self.translate_items(missing[:half], glossary, context),
+                           **self.translate_items(missing[half:], glossary, context)})
         return result
+
+    def _split_single(self, item: tuple[int, str], glossary: Glossary | None,
+                      context: list[tuple[str, str]] | None, reason: str) -> dict[int, str]:
+        """A lone segment failed: translate it in halves (a filter often trips on one passage only);
+        whatever still fails is kept in the original language and reported by the caller."""
+        i, text = item
+        parts = split_text(text, len(text) // 2 + 1) if len(text) >= MIN_SPLIT else [text]
+        if len(parts) < 2:
+            log.warning("segment %d could not be translated (%s); keeping original", i, reason)
+            return {i: text}
+        log.warning("segment %d failed (%s); retrying it in %d parts", i, reason, len(parts))
+        got = self.translate_items(list(enumerate(parts, 1)), glossary, context)
+        return {i: " ".join(got.get(n, p) for n, p in enumerate(parts, 1))}
+
+    # ------------------------------------------------------------------ glossary
+
+    def generate_glossary(self, candidates: list[tuple[str, int, str]], batch: int = 150) -> str:
+        """Ask the model which candidates must stay consistent and how to render them.
+        A batch that fails is skipped (logged) instead of aborting the book."""
+        system = GLOSSARY_PROMPT.format(language=self.cfg.target_name)
+        lines: list[str] = []
+        for start in range(0, len(candidates), batch):
+            part = candidates[start:start + batch]
+            try:
+                reply = self.call("\n".join(f"{t} ({n}): {ctx}" for t, n, ctx in part), system)
+            except TranslationError as exc:
+                # The example contexts can trip a content filter; the bare terms rarely do.
+                log.warning("glossary request failed (%s); retrying without context", exc)
+                try:
+                    reply = self.call("\n".join(f"{t} ({n})" for t, n, _ in part), system)
+                except TranslationError as exc2:
+                    log.warning("glossary batch skipped: %s", exc2)
+                    continue
+            text = re.sub(r"^```[a-zA-Z]*\s*|```\s*$", "", reply.strip())
+            lines += [ln.strip() for ln in text.splitlines() if "=" in ln and not ln.lstrip().startswith("#")]
+        return "\n".join(lines)

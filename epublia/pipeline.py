@@ -16,6 +16,7 @@ from lxml import etree
 from .cleanup import Cleaner
 from .config import Config
 from .epub import NCX_NS, EpubPackage, write_epub
+from .glossary import Glossary, find_candidates
 from .segmenter import (
     _HAS_LETTERS,
     Segment,
@@ -28,7 +29,7 @@ from .segmenter import (
     set_document_language,
     unwrap_runs,
 )
-from .translator import GeminiTranslator
+from .translator import GeminiTranslator, split_text
 
 log = logging.getLogger("epublia")
 
@@ -50,6 +51,12 @@ class Stats:
     tag_warnings: list[str] = field(default_factory=list)
     recovered_docs: list[str] = field(default_factory=list)
     requests: int = 0
+    name_issues: list[str] = field(default_factory=list)
+    incomplete: list[str] = field(default_factory=list)
+    renamed: int = 0  # cached segments re-translated because they broke the glossary
+    pending: int = 0
+    pending_chars: int = 0
+    planned_requests: int = 0
 
 
 class SegmentCache:
@@ -99,59 +106,227 @@ def _write_txt(path: Path, segments: list[tuple[int, str]], marked: bool) -> Non
     path.write_text(body + "\n", encoding="utf-8")
 
 
+GLOSSARY_HEADER = """# Auto-generated glossary for this book: edit freely, it is never regenerated while it exists
+# (delete it to build a new one). Format: "source = rendering", alternatives with " | ".
+# Entries in GLOSSARY_FILE override these. After editing, run with --fix-names to re-translate
+# only the segments that break a rule.
+"""
+
+
+def _tail(text: str, limit: int) -> str:
+    return text if len(text) <= limit else "…" + text[-limit:].split(" ", 1)[-1]
+
+
+_WORD = re.compile(r"[^\W\d_]{3,}")
+
+
+def _completeness_problem(source: str, translation: str) -> str | None:
+    """Flag translations that look partial: much shorter than the source (a dropped passage) or
+    still sharing many ordinary words with it (a sentence left in the source language)."""
+    src, dst = plain_text(source), plain_text(translation)
+    if len(src) < 300:
+        return None
+    ratio = len(dst) / len(src)
+    if ratio < 0.6:
+        return f"translation is {ratio:.0%} of the source length (passage dropped?)"
+    src_words = {w for w in _WORD.findall(src) if w.islower()}
+    dst_words = [w for w in _WORD.findall(dst) if w.islower()]
+    if len(dst_words) >= 30 and src_words:
+        shared = sum(w in src_words for w in dst_words) / len(dst_words)
+        if shared > 0.3:
+            return f"{shared:.0%} of the words are still in the source language (partly untranslated?)"
+    return None
+
+
+_LANG_FILES = ("cache", "translated", "translated-plain", "glossary.txt", "names.txt", "report.json")
+
+
+def _migrate_legacy_layout(book_work: Path, lang: str) -> None:
+    """Older versions kept translation files directly in work/<book>/; move them to work/<book>/<lang>/
+    (the language comes from the old report, so a cache is never reused for another language)."""
+    if not (book_work / "cache").is_dir():
+        return
+    old_lang = lang
+    try:
+        old_lang = json.loads((book_work / "report.json").read_text(encoding="utf-8"))["target_language"].lower()
+    except (OSError, ValueError, KeyError, AttributeError):
+        pass
+    dest = book_work / old_lang
+    if dest.exists():
+        return
+    dest.mkdir(parents=True)
+    for name in _LANG_FILES:
+        if (book_work / name).exists():
+            (book_work / name).replace(dest / name)
+    log.info("Moved previous %s translation files to %s", old_lang.upper(), dest)
+
+
 class BookTranslator:
     def __init__(self, cfg: Config, translator: GeminiTranslator | None, *, use_cache: bool = True,
-                 clean: bool = True):
+                 clean: bool = True, fix_names: bool = False):
         self.cfg = cfg
         self.clean = clean
         self.translator = translator
         self.use_cache = use_cache
+        self.fix_names = fix_names
+        self.dry_run = False
+        self.glossary = Glossary(cfg.glossary)
+        self._carry: list[tuple[str, str]] = []  # last (source, translation) pairs of the previous document
 
     def output_path(self, epub_path: Path) -> Path:
         return self.cfg.output_dir / f"{epub_path.stem}_{self.cfg.target_code.upper()}.epub"
 
     # ------------------------------------------------------------------ helpers
 
+    def _context(self, segs: list[Segment], result: dict[int, str], first: int) -> list[tuple[str, str]] | None:
+        """(source, translation) text right before segment ``first``, up to CONTEXT_CHARS of source."""
+        limit = self.cfg.context_chars
+        if not limit:
+            return None
+        before = [(plain_text(segs[i - 1].text), plain_text(result[i]))
+                  for i in range(1, first) if segs[i - 1].translatable and i in result]
+        out: list[tuple[str, str]] = []
+        size = 0
+        for src, dst in reversed(self._carry + before):
+            if not src.strip():
+                continue
+            room = limit - size
+            if room < 200:
+                break
+            if len(src) > room:
+                # Keep roughly the same share of the translation as of the source.
+                share = max(1, int(len(dst) * room / len(src)))
+                out.insert(0, (_tail(src, room), _tail(dst, share)))
+                break
+            out.insert(0, (src, dst))
+            size += len(src)
+        return out or None
+
+    def _split_units(self, items: list[tuple[int, str]]) -> tuple[list[tuple[int, str]], dict[int, tuple[int, int]]]:
+        """Very long segments (e.g. a whole PDF chapter in one <p>) are sent as sentence-aligned parts,
+        so a content-filter hit or a dropped marker costs one part, not the whole segment.
+        Returns ([(unit_id, text)], {unit_id: (segment index, number of parts)})."""
+        units: list[tuple[int, str]] = []
+        owner: dict[int, tuple[int, int]] = {}
+        for idx, text in items:
+            parts = split_text(text, self.cfg.segment_chars)
+            for part in parts:
+                units.append((len(units) + 1, part))
+                owner[len(units)] = (idx, len(parts))
+        return units, owner
+
+    def _translate_units(self, items: list[tuple[int, str]]) -> dict[int, str]:
+        """Translate whole segments [(index, text)] in one go (used for re-requests)."""
+        units, owner = self._split_units(items)
+        got = self.translator.translate_items(units, self.glossary)
+        parts: dict[int, list[str]] = {}
+        for u, t in units:
+            parts.setdefault(owner[u][0], []).append(got.get(u, t))
+        return {idx: " ".join(p) for idx, p in parts.items()}
+
     def _translate_segments(self, segs: list[Segment], cache: SegmentCache, label: str, stats: Stats) -> dict[int, str]:
-        """Return {segment_index: translated_text} for every translatable segment."""
+        """Return {segment_index: translated_text} for every translatable segment
+        (in a dry run, only for segments that need no request)."""
         result: dict[int, str] = {}
         pending: list[tuple[int, str]] = []
+        previous: dict[int, tuple[str, int]] = {}  # --fix-names: old translation and its rule breaks
         for idx, seg in enumerate(segs, 1):
             if not seg.translatable:
                 result[idx] = seg.text
                 continue
             hit = cache.get(seg.text)
+            broken_rules = (self.fix_names and hit is not None
+                            and self.glossary.violations(plain_text(seg.text), plain_text(hit)))
+            if broken_rules:
+                stats.renamed += 1
+                previous[idx] = (hit, len(broken_rules))
+                hit = None
             if hit is not None:
                 result[idx] = hit
             else:
                 pending.append((idx, seg.text))
+        units, owner = self._split_units(pending)
+        chunks = _chunks(units, self.cfg.max_chars)
+        if self.dry_run:
+            stats.pending += len(pending)
+            stats.pending_chars += sum(len(t) for _, t in pending)
+            stats.planned_requests += len(chunks)
+            result.update({i: old for i, (old, _) in previous.items()})  # still reported in names.txt
+            return result
         if pending and self.translator is None:
             raise RuntimeError("translator not configured")
-        chunks = _chunks(pending, self.cfg.max_chars)
+        partial: dict[int, list[tuple[int, str]]] = {}
         for n, chunk in enumerate(chunks, 1):
             t0 = time.monotonic()
-            got = self.translator.translate_items(chunk)
+            first = owner[chunk[0][0]][0]
+            got = self.translator.translate_items(chunk, self.glossary, self._context(segs, result, first))
+            done: dict[int, str] = {}
+            for u, t in chunk:
+                idx, total = owner[u]
+                partial.setdefault(idx, []).append((u, got.get(u, t)))
+                if len(partial[idx]) == total:
+                    done[idx] = " ".join(t for _, t in sorted(partial.pop(idx)))
             # Placeholder tags must survive; re-ask once, alone, for segments that broke them.
-            broken = [(i, t) for i, t in chunk if check_placeholders(segs[i - 1], got.get(i, t))]
+            broken = [idx for idx in done if check_placeholders(segs[idx - 1], done[idx])]
             if broken:
                 log.info("  %d segment(s) with damaged inline tags, re-requesting", len(broken))
-                retry = self.translator.translate_items(broken)
-                for i, _ in broken:
-                    if not check_placeholders(segs[i - 1], retry.get(i, "")):
-                        got[i] = retry[i]
-            cache.put_many([(t, got.get(i, t)) for i, t in chunk])
-            for i, t in chunk:
-                result[i] = got.get(i, t)
+                retry = self._translate_units([(idx, segs[idx - 1].text) for idx in broken])
+                for idx in broken:
+                    if not check_placeholders(segs[idx - 1], retry.get(idx, "")):
+                        done[idx] = retry[idx]
+            # A re-translation for --fix-names must not make things worse (blocked, missing, more breaks).
+            for idx, new in done.items():
+                if idx in previous:
+                    old, n_old = previous[idx]
+                    src = segs[idx - 1].text
+                    if (new.strip() == src.strip() or check_placeholders(segs[idx - 1], new)
+                            or len(self.glossary.violations(plain_text(src), plain_text(new))) >= n_old):
+                        done[idx] = old
+            cache.put_many([(segs[idx - 1].text, t) for idx, t in done.items()])
+            result.update(done)
             log.info("  %s: request %d/%d (%d segments) done in %.1fs",
-                     label, n, len(chunks), len(chunk), time.monotonic() - t0)
+                     label, n, len(chunks), len({owner[u][0] for u, _ in chunk}), time.monotonic() - t0)
         return result
 
     # ------------------------------------------------------------------ main
 
-    def translate(self, epub_path: Path, *, extract_only: bool = False, clean_only: bool = False) -> Path | None:
+    def _load_glossary(self, work: Path, parsed: list, *, generate: bool) -> None:
+        """Auto glossary in work/<book>/<lang>/glossary.txt (created once), overridden by GLOSSARY_FILE.
+        The raw candidate list is language-independent and lives in work/<book>/."""
+        path = work / "glossary.txt"
+        if not path.exists() and self.cfg.auto_glossary:
+            texts = [plain_text(s.text) for *_, segs in parsed for s in segs if s.translatable]
+            candidates = find_candidates(texts)
+            work.mkdir(parents=True, exist_ok=True)
+            cand_path = work.parent / "glossary-candidates.txt"
+            cand_path.write_text("".join(f"{n:5d}  {t}  |  {ctx}\n" for t, n, ctx in candidates), encoding="utf-8")
+            if candidates and generate and self.translator is not None:
+                log.info("Glossary: asking the model to render %d candidate terms...", len(candidates))
+                text = self.translator.generate_glossary(candidates)
+                if not text.strip():
+                    log.warning("Glossary: the model returned no terms; translating without an auto glossary")
+                    text = "# (the model returned no terms)"
+                path.write_text(GLOSSARY_HEADER + text + "\n", encoding="utf-8")
+            elif candidates:
+                log.info("Glossary: %d candidate terms found (%s); it will be generated with the model "
+                         "on the first translating run", len(candidates), cand_path)
+        auto = path.read_text(encoding="utf-8") if path.exists() else ""
+        self.glossary = Glossary(auto, self.cfg.glossary)
+        if self.glossary:
+            log.info("Glossary: %d terms (%s%s)", len(self.glossary), path if auto else "",
+                     " + GLOSSARY_FILE" if self.cfg.glossary else "")
+
+    def translate(self, epub_path: Path, *, extract_only: bool = False, clean_only: bool = False,
+                  dry_run: bool = False, glossary_only: bool = False) -> Path | None:
         book = EpubPackage(epub_path)
-        work = self.cfg.work_dir / slugify(epub_path.stem)
+        # work/<book>/ holds language-independent files (source TXT, cleanup log); translation
+        # artefacts (cache, glossary, output TXT, reports) go to work/<book>/<lang>/.
+        book_work = self.cfg.work_dir / slugify(epub_path.stem)
+        work = book_work / self.cfg.target_code.lower()
+        _migrate_legacy_layout(book_work, self.cfg.target_code.lower())
         stats = Stats()
+        self.dry_run = dry_run
+        self._carry = []
         log.info("Book: %s — %s (lang=%s, EPUB %s)", book.title, book.author or "?", book.language or "?", book.version)
         log.info("Work dir: %s", work)
 
@@ -173,11 +348,19 @@ class BookTranslator:
             cleaner = Cleaner(book.title, book.author)
             cleaner.learn([s for *_, segs in parsed for s in segs])
             parsed = [(n, item, tree, cleaner.clean_document(segs, item.path)) for n, item, tree, segs in parsed]
-            (work / "cleanup.txt").parent.mkdir(parents=True, exist_ok=True)
-            (work / "cleanup.txt").write_text(
+            book_work.mkdir(parents=True, exist_ok=True)
+            (book_work / "cleanup.txt").write_text(
                 cleaner.log.summary() + "\n\n" + "\n".join(cleaner.log.entries) + "\n", encoding="utf-8")
             log.info("Cleanup: %s", cleaner.log.summary())
-            log.info("Cleanup details: %s", work / "cleanup.txt")
+            log.info("Cleanup details: %s", book_work / "cleanup.txt")
+
+        # Phase 2b: glossary of names/terms that must stay consistent (needs the whole cleaned book).
+        if not (extract_only or clean_only):
+            self._load_glossary(work, parsed, generate=not dry_run)
+            if glossary_only:
+                log.info("Review/edit %s, then run the translation (add --fix-names to apply it to "
+                         "an existing translation).", work / "glossary.txt")
+                return None
 
         # Phase 3: per chapter TXT -> Gemini -> TXT -> XHTML.
         for n, item, tree, segs in parsed:
@@ -185,8 +368,8 @@ class BookTranslator:
             label = f"[{n:03d}/{len(docs):03d}] {name}"
             stem = f"{n:03d}_{Path(name).stem}"
             numbered = [(i, s.text) for i, s in enumerate(segs, 1)]
-            _write_txt(work / "source" / f"{stem}.txt", numbered, marked=True)
-            _write_txt(work / "source-plain" / f"{stem}.txt", numbered, marked=False)
+            _write_txt(book_work / "source" / f"{stem}.txt", numbered, marked=True)
+            _write_txt(book_work / "source-plain" / f"{stem}.txt", numbered, marked=False)
             stats.segments += len(segs)
             if extract_only:
                 log.info("%s: %d segments extracted", label, len(segs))
@@ -198,6 +381,15 @@ class BookTranslator:
                 log.info("%s: %d segments", label, len(segs))
                 cache = SegmentCache(work / "cache" / f"{stem}.json", self.use_cache)
                 translations = self._translate_segments(segs, cache, label, stats)
+                pairs = [(plain_text(s.text), plain_text(translations[i]))
+                         for i, s in enumerate(segs, 1) if s.translatable and i in translations]
+                self._carry = pairs[-3:] or self._carry
+                for i, s in enumerate(segs, 1):
+                    if s.translatable and i in translations:
+                        for v in self.glossary.violations(plain_text(s.text), plain_text(translations[i])):
+                            stats.name_issues.append(f"{item.path}#{i}: {v}")
+            if dry_run:
+                continue
 
             out_numbered = []
             for i, seg in enumerate(segs, 1):
@@ -209,6 +401,9 @@ class BookTranslator:
                     stats.unchanged.append(f"{item.path}#{i}: {plain_text(seg.text)[:80]}")
                 elif seg.translatable:
                     stats.translated += 1
+                    problem = _completeness_problem(seg.text, dst)
+                    if problem:
+                        stats.incomplete.append(f"{item.path}#{i}: {problem}")
                 for w in apply_translation(seg, dst):
                     stats.tag_warnings.append(f"{item.path}#{i}: {w}")
             unwrap_runs(tree)
@@ -219,7 +414,10 @@ class BookTranslator:
             replacements[item.path] = serialize_xhtml(tree)
 
         if extract_only:
-            log.info("Extracted %d segments from %d documents into %s", stats.segments, stats.documents, work)
+            log.info("Extracted %d segments from %d documents into %s", stats.segments, stats.documents, book_work)
+            return None
+        if dry_run:
+            self._dry_run_summary(work, stats)
             return None
         if clean_only:
             out = self.cfg.output_dir / f"{epub_path.stem}_CLEAN.epub"
@@ -257,7 +455,7 @@ class BookTranslator:
             items = [(i, " ".join(t.text.split())) for i, t in enumerate(labels, 1)]
             pending = [(i, s) for i, s in items if cache.get(s) is None and _HAS_LETTERS.search(s)]
             if pending:
-                got = self.translator.translate_items(pending)
+                got = self.translator.translate_items(pending, self.glossary)
                 cache.put_many([(s, got.get(i, s)) for i, s in pending])
                 log.info("  toc.ncx: %d labels translated", len(pending))
             for (i, s), el in zip(items, labels):
@@ -266,7 +464,34 @@ class BookTranslator:
                     el.text = plain_text(hit)
         return etree.tostring(ncx, xml_declaration=True, encoding="utf-8")
 
+    def _write_names(self, work: Path, stats: Stats) -> None:
+        path = work / "names.txt"
+        if not self.glossary:
+            return
+        header = (f"{len(stats.name_issues)} glossary rule(s) broken. Fix the glossary if a rule is wrong, or run "
+                  f"with --fix-names to re-translate these segments.\n\n")
+        path.write_text(header + "\n".join(stats.name_issues) + "\n", encoding="utf-8")
+        segs = len({i.split(": ", 1)[0] for i in stats.name_issues})
+        log.info("Name consistency: %d issue(s) in %d segment(s) -> %s", len(stats.name_issues), segs, path)
+
+    def _dry_run_summary(self, work: Path, stats: Stats) -> None:
+        self._write_names(work, stats)
+        glossary_requests = 0
+        if self.cfg.auto_glossary and not (work / "glossary.txt").exists():
+            cand = work.parent / "glossary-candidates.txt"
+            n = len(cand.read_text(encoding="utf-8").splitlines()) if cand.exists() else 0
+            glossary_requests = -(-n // 150)
+        total = stats.planned_requests + glossary_requests
+        log.info("Dry run: %d documents, %d segments; %d to translate (%s chars, ~%s tokens in)%s",
+                 stats.documents, stats.segments, stats.pending, f"{stats.pending_chars:,}",
+                 f"{stats.pending_chars // 4:,}",
+                 f", {stats.renamed} of them because they break the glossary" if stats.renamed else "")
+        log.info("Dry run: ~%d API request(s) (%d translation + %d glossary)%s", total,
+                 stats.planned_requests, glossary_requests,
+                 f", ~{-(-total // self.cfg.rpd)} day(s) at GEMINI_RPD={self.cfg.rpd}" if self.cfg.rpd and total else "")
+
     def _report(self, work: Path, out: Path, stats: Stats, problems: list[str]) -> None:
+        self._write_names(work, stats)
         report = {
             "output": str(out),
             "model": self.cfg.model,
@@ -276,13 +501,20 @@ class BookTranslator:
             "translated_segments": stats.translated,
             "api_requests_this_run": stats.requests,
             "possibly_untranslated": stats.unchanged,
+            "possibly_incomplete": stats.incomplete,
             "inline_tag_warnings": stats.tag_warnings,
+            "glossary_terms": len(self.glossary),
+            "retranslated_for_names": stats.renamed,
+            "name_consistency_issues": stats.name_issues,
             "malformed_source_documents": stats.recovered_docs,
             "validation_problems": problems,
         }
         (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        log.info("Segments: %d | translated: %d | possibly untranslated: %d | tag warnings: %d | API requests: %d",
-                 stats.segments, stats.translated, len(stats.unchanged), len(stats.tag_warnings), stats.requests)
+        log.info("Segments: %d | translated: %d | possibly untranslated: %d | possibly incomplete: %d | "
+                 "tag warnings: %d | API requests: %d", stats.segments, stats.translated, len(stats.unchanged),
+                 len(stats.incomplete), len(stats.tag_warnings), stats.requests)
+        for entry in stats.unchanged + stats.incomplete:
+            log.warning("CHECK: %s", entry)
         if problems:
             for p in problems:
                 log.error("VALIDATION: %s", p)

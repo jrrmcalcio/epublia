@@ -258,6 +258,41 @@ def _append_text(parent, text: str) -> None:
         parent.text = (parent.text or "") + text
 
 
+def close_unclosed(seg: Segment, translated: str) -> str:
+    """The model sometimes drops a closing tag (``<x5>…`` with no ``</x5>``). Close such a tag where
+    its original element must have ended: before the next tag that was not inside it, or at the end."""
+    tokens = list(_TOKEN.finditer(translated))
+    first_open: dict[int, int] = {}
+    closed: set[int] = set()
+    for t, m in enumerate(tokens):
+        k = int(m.group(2))
+        if m.group(1) == "/":
+            closed.add(k)
+        elif m.group(3) != "/":
+            first_open.setdefault(k, t)
+    never = [k for k in first_open if k not in closed and k in seg.refs and k not in seg.void_ids]
+    if not never:
+        return translated
+    at: dict[int, list[int]] = {}
+    for k in never:
+        el = seg.refs[k]
+        pos = len(translated)
+        for m in tokens[first_open[k] + 1:]:
+            other = seg.refs.get(int(m.group(2)))
+            if other is not None and other is not el and not any(a is el for a in other.iterancestors()):
+                pos = m.start()
+                break
+        at.setdefault(pos, []).append(k)
+    out, last = [], 0
+    for pos in sorted(at):
+        # Innermost first when several close at the same spot.
+        ks = sorted(at[pos], key=lambda k: -sum(1 for _ in seg.refs[k].iterancestors()))
+        out.append(translated[last:pos] + "".join(f"</x{k}>" for k in ks))
+        last = pos
+    out.append(translated[last:])
+    return "".join(out)
+
+
 def sanitize_placeholders(seg: Segment, translated: str) -> str:
     """Drop wrapper tags that are unknown, duplicated, unclosed or misnested, so a model mistake can
     at worst lose a bit of inline formatting instead of e.g. italicising the rest of the paragraph.
@@ -300,7 +335,10 @@ def apply_translation(seg: Segment, translated: str) -> list[str]:
     """Replace the segment's text with `translated`. Returns warnings (never raises on bad tags)."""
     warnings = check_placeholders(seg, translated)
     if warnings:
-        translated = sanitize_placeholders(seg, translated)
+        repaired = close_unclosed(seg, translated)
+        if repaired != translated and not check_placeholders(seg, repaired):
+            warnings = [w + " (closing tag restored)" for w in warnings]
+        translated = sanitize_placeholders(seg, repaired)
     el = seg.element
     tail = el.tail
     for child in list(el):

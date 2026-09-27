@@ -56,6 +56,9 @@ class Config:
     output_dir: Path
     work_dir: Path
     glossary: str
+    context_chars: int = 1500
+    auto_glossary: bool = True
+    segment_chars: int = 6000
 
     def redact(self, text: str) -> str:
         """Remove the API key from any string before it is shown or logged."""
@@ -100,4 +103,7 @@ def load_config(require_key: bool = True) -> Config:
         output_dir=_path("OUTPUT_DIR", "books-outputs"),
         work_dir=_path("WORK_DIR", "work"),
         glossary=glossary,
+        context_chars=max(0, _int("CONTEXT_CHARS", 1500)),
+        segment_chars=max(1500, _int("SEGMENT_SPLIT_CHARS", 6000)),
+        auto_glossary=os.getenv("AUTO_GLOSSARY", "true").strip().lower() not in ("0", "false", "no", "off"),
     )
