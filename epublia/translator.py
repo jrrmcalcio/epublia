@@ -295,8 +295,8 @@ class GeminiTranslator:
                 log.warning("segment %d: backup translator failed too (%s)", i, exc)
                 got = None
             if got:
-                self.fallback_used.append(" ".join(_TAG.sub("", text).split())[:70])
-                log.info("segment %d translated by the backup model (%s)", i, reason)
+                self.fallback_used.append(f"[{self.fallback.last_model}] " + " ".join(_TAG.sub("", text).split())[:70])
+                log.info("segment %d translated by the backup model %s (%s)", i, self.fallback.last_model, reason)
                 return {i: got}
         log.warning("segment %d could not be translated (%s); keeping original", i, reason)
         return {i: text}

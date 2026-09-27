@@ -183,12 +183,21 @@ are listed under `translated_by_backup_model` in `report.json`.
 ```ini
 FALLBACK_BASE_URL=https://openrouter.ai/api/v1
 FALLBACK_API_KEY=sk-or-...
-FALLBACK_MODEL=<model id>
+FALLBACK_MODEL=<model id>[,<another>,...]   # tried in order; a busy one is skipped
 FALLBACK_RPM=10        # client-side throttle
 FALLBACK_RPD=0         # optional local daily cap
 ```
 
-`epublia --check` sends one test request to the backup model too. Where to get a key (free tiers
+`FALLBACK_MODEL` accepts a comma-separated list: a model that is busy (HTTP 429), retired or
+refuses the passage hands it to the next one without waiting. Free models are often saturated,
+so a good OpenRouter setup is one or two specific free models followed by `openrouter/free`, a
+router that picks whichever free model is available (slower and less consistent, but rarely busy):
+
+```ini
+FALLBACK_MODEL=google/gemma-4-31b-it:free,qwen/qwen3.8-27b:free,openrouter/free
+```
+
+`epublia --check` sends one test request to the backup model too and shows which model answered. Where to get a key (free tiers
 and model names change often; check the provider's page):
 
 | Provider | Key | Base URL | Cost |
@@ -314,7 +323,7 @@ Releases are published to PyPI by `.github/workflows/publish.yml` using PyPI tru
 
 1. Once, on <https://pypi.org/manage/account/publishing/>, add a pending publisher: project
    `epublia`, owner `jrrmcalcio`, repository `epublia`, workflow `publish.yml`, environment `pypi`.
-2. Bump `__version__` in `epublia/__init__.py`, commit, then `git tag v0.3.0 && git push --tags`.
+2. Bump `__version__` in `epublia/__init__.py`, commit, then `git tag v0.3.1 && git push --tags`.
 
 ## License
 

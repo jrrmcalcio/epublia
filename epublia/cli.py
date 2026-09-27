@@ -88,7 +88,7 @@ def cmd_check(cfg) -> int:
     if tr.fallback is not None:
         try:
             reply = tr.fallback.call(tr.build_prompt([(1, "The brown fox jumps over the lazy dog.")]), tr.system_prompt)
-            print(f"Backup model {cfg.fallback_model}: {tr.parse_response(reply).get(1)}")
+            print(f"Backup model {tr.fallback.last_model} (of {cfg.fallback_model}): {tr.parse_response(reply).get(1)}")
         except Exception as exc:  # noqa: BLE001
             print("Backup model test failed:", cfg.redact(str(exc)))
             return 2

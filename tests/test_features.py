@@ -64,6 +64,7 @@ def test_fallback_translates_the_passage_gemini_blocks(tmp_path):
 
     class Backup:
         requests_made = 0
+        last_model = "m1"
 
         def call(self, prompt, system):
             return "[[1]] RESPALDO"
@@ -71,7 +72,7 @@ def test_fallback_translates_the_passage_gemini_blocks(tmp_path):
     fake = FakeTranslator(cfg, block_word="FORBIDDEN")
     fake.fallback = Backup()
     assert fake.translate_items([(1, "A short FORBIDDEN line.")]) == {1: "RESPALDO"}
-    assert fake.fallback_used == ["A short FORBIDDEN line."]
+    assert fake.fallback_used == ["[m1] A short FORBIDDEN line."]
 
     class Broken:
         def call(self, prompt, system):
@@ -149,3 +150,38 @@ def test_epubcheck_ignores_context_dependent_expected_tail(tmp_path, monkeypatch
     new = [dict(old[0], message='element "img" not allowed here; expected the element end-tag or element "p"')]
     monkeypatch.setattr(epubcheck, "run", lambda cmd, p: new if p.name == "out.epub" else old)
     assert epubcheck.new_problems(["x"], tmp_path / "in.epub", tmp_path / "out.epub")["new_errors"] == []
+
+
+def test_backup_model_list_skips_busy_and_retired_models(tmp_path, monkeypatch):
+    import httpx
+
+    from epublia.fallback import OpenAICompatClient
+    from epublia.rate_limiter import RateLimiter
+
+    seen = []
+
+    def handler(request):
+        model = __import__("json").loads(request.content)["model"]
+        seen.append(model)
+        if model == "busy":
+            return httpx.Response(429)
+        if model == "gone":
+            return httpx.Response(404, text="no such model")
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                                                      "message": {"content": "<think>hmm</think>[[1]] Hola"}}]})
+
+    client = OpenAICompatClient("https://x/api/v1", "k", "busy, gone, good", RateLimiter(1000),
+                                transport=httpx.MockTransport(handler))
+    assert client.call("[[1]] Hi", "sys") == "[[1]] Hola"
+    assert seen == ["busy", "gone", "good"] and client.last_model == "good"
+
+    refusing = OpenAICompatClient("https://x/api/v1", "k", "busy", RateLimiter(1000),
+                                  transport=httpx.MockTransport(handler))
+    import epublia.fallback as fb
+    monkeypatch.setattr(fb.time, "sleep", lambda s: None)  # no real waiting in tests
+    try:
+        refusing.call("x", "sys", attempts=2)
+    except FallbackError as exc:
+        assert "429" in str(exc)
+    else:
+        raise AssertionError("expected FallbackError")
