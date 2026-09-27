@@ -13,13 +13,15 @@ from pathlib import Path
 
 from lxml import etree
 
+from . import epubcheck
 from .cleanup import Cleaner
-from .config import Config
+from .config import ROOT, Config
 from .epub import NCX_NS, EpubPackage, write_epub
-from .glossary import Glossary, find_candidates
+from .glossary import Glossary, find_candidates, merge
 from .segmenter import (
     _HAS_LETTERS,
     Segment,
+    add_original,
     apply_translation,
     check_placeholders,
     extract_segments,
@@ -53,6 +55,7 @@ class Stats:
     requests: int = 0
     name_issues: list[str] = field(default_factory=list)
     incomplete: list[str] = field(default_factory=list)
+    fallback: list[str] = field(default_factory=list)
     renamed: int = 0  # cached segments re-translated because they broke the glossary
     pending: int = 0
     pending_chars: int = 0
@@ -112,6 +115,10 @@ GLOSSARY_HEADER = """# Auto-generated glossary for this book: edit freely, it is
 # only the segments that break a rule.
 """
 
+SERIES_HEADER = """# Series glossary for "{series}": every book translated with this series adds or updates its terms here
+# (the book's own glossary wins). New books of the series start from these renderings. Editable.
+"""
+
 
 def _tail(text: str, limit: int) -> str:
     return text if len(text) <= limit else "…" + text[-limit:].split(" ", 1)[-1]
@@ -163,18 +170,26 @@ def _migrate_legacy_layout(book_work: Path, lang: str) -> None:
 
 class BookTranslator:
     def __init__(self, cfg: Config, translator: GeminiTranslator | None, *, use_cache: bool = True,
-                 clean: bool = True, fix_names: bool = False):
+                 clean: bool = True, fix_names: bool = False, bilingual: bool = False):
         self.cfg = cfg
         self.clean = clean
         self.translator = translator
         self.use_cache = use_cache
         self.fix_names = fix_names
+        self.bilingual = bilingual
         self.dry_run = False
         self.glossary = Glossary(cfg.glossary)
+        self.series = ""
         self._carry: list[tuple[str, str]] = []  # last (source, translation) pairs of the previous document
 
     def output_path(self, epub_path: Path) -> Path:
-        return self.cfg.output_dir / f"{epub_path.stem}_{self.cfg.target_code.upper()}.epub"
+        suffix = "_bilingual" if self.bilingual else ""
+        return self.cfg.output_dir / f"{epub_path.stem}_{self.cfg.target_code.upper()}{suffix}.epub"
+
+    def series_glossary_path(self) -> Path | None:
+        if not self.series:
+            return None
+        return self.cfg.work_dir / "series" / slugify(self.series.lower()) / self.cfg.target_code.lower() / "glossary.txt"
 
     # ------------------------------------------------------------------ helpers
 
@@ -294,19 +309,31 @@ class BookTranslator:
         """Auto glossary in work/<book>/<lang>/glossary.txt (created once), overridden by GLOSSARY_FILE.
         The raw candidate list is language-independent and lives in work/<book>/."""
         path = work / "glossary.txt"
+        series_path = self.series_glossary_path()
         if not path.exists() and self.cfg.auto_glossary:
             texts = [plain_text(s.text) for *_, segs in parsed for s in segs if s.translatable]
             candidates = find_candidates(texts)
             work.mkdir(parents=True, exist_ok=True)
             cand_path = work.parent / "glossary-candidates.txt"
             cand_path.write_text("".join(f"{n:5d}  {t}  |  {ctx}\n" for t, n, ctx in candidates), encoding="utf-8")
-            if candidates and generate and self.translator is not None:
-                log.info("Glossary: asking the model to render %d candidate terms...", len(candidates))
-                text = self.translator.generate_glossary(candidates)
-                if not text.strip():
-                    log.warning("Glossary: the model returned no terms; translating without an auto glossary")
-                    text = "# (the model returned no terms)"
-                path.write_text(GLOSSARY_HEADER + text + "\n", encoding="utf-8")
+            # Terms already decided for the series are reused as they are, not rendered again.
+            series = Glossary(series_path.read_text(encoding="utf-8")) if series_path and series_path.exists() else Glossary()
+            inherited = series.relevant("\n".join(texts))
+            known = {e.source for e in inherited}
+            candidates = [c for c in candidates if c[0] not in known]
+            if inherited:
+                log.info("Glossary: %d terms inherited from series '%s'", len(inherited), self.series)
+            if (candidates or inherited) and generate and self.translator is not None:
+                text = ""
+                if candidates:
+                    log.info("Glossary: asking the model to render %d candidate terms...", len(candidates))
+                    text = self.translator.generate_glossary(candidates)
+                    if not text.strip():
+                        log.warning("Glossary: the model returned no terms")
+                series_block = ("# From the series glossary\n" + "\n".join(e.line for e in inherited) + "\n\n"
+                                if inherited else "")
+                path.write_text(GLOSSARY_HEADER + series_block + (text or "# (no new terms)") + "\n",
+                                encoding="utf-8")
             elif candidates:
                 log.info("Glossary: %d candidate terms found (%s); it will be generated with the model "
                          "on the first translating run", len(candidates), cand_path)
@@ -315,6 +342,43 @@ class BookTranslator:
         if self.glossary:
             log.info("Glossary: %d terms (%s%s)", len(self.glossary), path if auto else "",
                      " + GLOSSARY_FILE" if self.cfg.glossary else "")
+
+    def _update_series_glossary(self, work: Path) -> None:
+        """After a translation, fold this book's glossary into the series one (the book's choices win),
+        so the next book of the series starts from the same names."""
+        series_path = self.series_glossary_path()
+        book = work / "glossary.txt"
+        if not series_path or not book.exists():
+            return
+        base = series_path.read_text(encoding="utf-8") if series_path.exists() else ""
+        text, added, changed = merge(base, book.read_text(encoding="utf-8"))
+        if added or changed or not series_path.exists():
+            series_path.parent.mkdir(parents=True, exist_ok=True)
+            series_path.write_text(SERIES_HEADER.format(series=self.series) + text + "\n", encoding="utf-8")
+            log.info("Series glossary '%s': %d new, %d changed -> %s", self.series, added, changed, series_path)
+
+    def _translate_metadata(self, book: EpubPackage, work: Path) -> tuple[str | None, str | None]:
+        """Translated (title, description) for the OPF, cached like everything else."""
+        if self.translator is None and not self.use_cache:
+            return None, None
+        cache = SegmentCache(work / "cache" / "metadata.json", self.use_cache)
+        title = None
+        if book.title:
+            key = "title\n" + book.title
+            title = cache.get(key)
+            if title is None and self.translator is not None:
+                title = self.translator.translate_title(book.title, book.author)
+                cache.put_many([(key, title)])
+                log.info("Title: %s -> %s", book.title, title)
+        desc = None
+        # Descriptions holding (escaped) HTML are left alone: translating markup as text is risky.
+        if book.description and "<" not in book.description and _HAS_LETTERS.search(book.description):
+            desc = cache.get(book.description)
+            if desc is None and self.translator is not None:
+                got = self.translator.translate_items([(1, book.description)], self.glossary)
+                desc = plain_text(got.get(1, book.description))
+                cache.put_many([(book.description, desc)])
+        return title, desc
 
     def translate(self, epub_path: Path, *, extract_only: bool = False, clean_only: bool = False,
                   dry_run: bool = False, glossary_only: bool = False) -> Path | None:
@@ -329,6 +393,9 @@ class BookTranslator:
         self._carry = []
         log.info("Book: %s — %s (lang=%s, EPUB %s)", book.title, book.author or "?", book.language or "?", book.version)
         log.info("Work dir: %s", work)
+        self.series = "" if self.cfg.series.lower() == "none" else (self.cfg.series or book.series)
+        if self.series:
+            log.info("Series: %s", self.series)
 
         replacements: dict[str, bytes] = {}
         docs = book.content_documents()
@@ -406,6 +473,8 @@ class BookTranslator:
                         stats.incomplete.append(f"{item.path}#{i}: {problem}")
                 for w in apply_translation(seg, dst):
                     stats.tag_warnings.append(f"{item.path}#{i}: {w}")
+                if self.bilingual and not clean_only and seg.translatable and dst.strip() != seg.text.strip():
+                    add_original(seg, seg.text)
             unwrap_runs(tree)
             if not clean_only:
                 set_document_language(tree, self.cfg.target_code)
@@ -428,23 +497,40 @@ class BookTranslator:
             log.info("Cleaned (untranslated) EPUB: %s", out)
             return out
 
-        opf_bytes, old_uid, new_uid = book.translated_opf(self.cfg.target_code, self.cfg.target_name, self.cfg.model)
+        title, description = self._translate_metadata(book, work)
+        opf_bytes, old_uid, new_uid = book.translated_opf(self.cfg.target_code, self.cfg.target_name, self.cfg.model,
+                                                          title=title, description=description)
         replacements[book.opf_path] = opf_bytes
         if book.ncx_path:
-            replacements[book.ncx_path] = self._translate_ncx(book, work, old_uid, new_uid, stats)
+            replacements[book.ncx_path] = self._translate_ncx(book, work, old_uid, new_uid, stats, title)
 
         if self.translator:
-            stats.requests = self.translator.requests_made
+            stats.requests = self.translator.requests_made + (
+                self.translator.fallback.requests_made if self.translator.fallback else 0)
+            stats.fallback = list(self.translator.fallback_used)
+            self.translator.fallback_used.clear()
         out = self.output_path(epub_path)
         write_epub(book.zip, out, replacements)
         problems = validate_epub(out, epub_path)
-        self._report(work, out, stats, problems)
+        checked = None
+        cmd = epubcheck.find_command(self.cfg.epubcheck, ROOT)
+        if cmd:
+            log.info("Running EPUBCheck...")
+            checked = epubcheck.new_problems(cmd, epub_path, out)
+            if checked:
+                problems += [f"EPUBCheck: {e}" for e in checked["new_errors"]]
+        self._update_series_glossary(work)
+        self._report(work, out, stats, problems, checked)
         return out
 
-    def _translate_ncx(self, book: EpubPackage, work: Path, old_uid, new_uid, stats: Stats) -> bytes:
+    def _translate_ncx(self, book: EpubPackage, work: Path, old_uid, new_uid, stats: Stats,
+                       title: str | None = None) -> bytes:
         parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=True)
         ncx = etree.fromstring(book.read(book.ncx_path), parser)
         ncx.set("{http://www.w3.org/XML/1998/namespace}lang", self.cfg.target_code)
+        doc_title = ncx.find(f"{{{NCX_NS}}}docTitle/{{{NCX_NS}}}text")
+        if title and doc_title is not None:
+            doc_title.text = title
         if old_uid and new_uid:
             for meta in ncx.iter(f"{{{NCX_NS}}}meta"):
                 if meta.get("name") == "dtb:uid":
@@ -490,12 +576,14 @@ class BookTranslator:
                  stats.planned_requests, glossary_requests,
                  f", ~{-(-total // self.cfg.rpd)} day(s) at GEMINI_RPD={self.cfg.rpd}" if self.cfg.rpd and total else "")
 
-    def _report(self, work: Path, out: Path, stats: Stats, problems: list[str]) -> None:
+    def _report(self, work: Path, out: Path, stats: Stats, problems: list[str], checked: dict | None = None) -> None:
         self._write_names(work, stats)
         report = {
             "output": str(out),
             "model": self.cfg.model,
             "target_language": self.cfg.target_code,
+            "bilingual": self.bilingual,
+            "series": self.series,
             "documents": stats.documents,
             "segments": stats.segments,
             "translated_segments": stats.translated,
@@ -506,8 +594,10 @@ class BookTranslator:
             "glossary_terms": len(self.glossary),
             "retranslated_for_names": stats.renamed,
             "name_consistency_issues": stats.name_issues,
+            "translated_by_backup_model": stats.fallback,
             "malformed_source_documents": stats.recovered_docs,
             "validation_problems": problems,
+            "epubcheck": checked if checked is not None else "not run (install Java + epubcheck --install-epubcheck)",
         }
         (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         log.info("Segments: %d | translated: %d | possibly untranslated: %d | possibly incomplete: %d | "
@@ -515,6 +605,14 @@ class BookTranslator:
                  len(stats.incomplete), len(stats.tag_warnings), stats.requests)
         for entry in stats.unchanged + stats.incomplete:
             log.warning("CHECK: %s", entry)
+        if stats.fallback:
+            log.info("%d passage(s) translated by the backup model (%s); see report.json",
+                     len(stats.fallback), self.cfg.fallback_model)
+        if checked is not None:
+            log.info("EPUBCheck: %d new error(s), %d new warning(s) (%d already in the original)",
+                     len(checked["new_errors"]), len(checked["new_warnings"]), checked["preexisting_messages"])
+            for w in checked["new_warnings"]:
+                log.warning("EPUBCheck: %s", w)
         if problems:
             for p in problems:
                 log.error("VALIDATION: %s", p)

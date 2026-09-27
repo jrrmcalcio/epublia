@@ -23,6 +23,7 @@ class FakeTranslator(GeminiTranslator):
     def __init__(self, cfg, block_word=None):
         self.cfg, self.block_word, self.prompts, self.requests_made = cfg, block_word, [], 0
         self.system_prompt = "sys"
+        self.fallback, self.fallback_used = None, []
 
     def call(self, prompt, system=None):
         self.prompts.append(prompt)

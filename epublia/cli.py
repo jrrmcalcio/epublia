@@ -9,11 +9,26 @@ import sys
 import unicodedata
 from pathlib import Path
 
+from . import __version__
 from .config import ConfigError, load_config
 from .epub import EpubError
 from .rate_limiter import DailyLimitReached, RateLimiter
 
 log = logging.getLogger("epublia")
+
+ENV_TEMPLATE = """# epublia settings (full reference: https://github.com/jrrmcalcio/epublia#configuration)
+# Free Gemini key: https://aistudio.google.com/apikey (use a project WITHOUT billing to stay free)
+GEMINI_API_TOKEN=
+TARGET_LANGUAGE=ES
+GEMINI_MODEL=gemini-3.8-flash
+GEMINI_RPM=10
+GEMINI_THINKING_LEVEL=low
+
+# Optional backup model for passages Gemini refuses (any OpenAI-compatible API)
+# FALLBACK_BASE_URL=https://openrouter.ai/api/v1
+# FALLBACK_API_KEY=
+# FALLBACK_MODEL=
+"""
 
 
 def _norm(text: str) -> str:
@@ -70,6 +85,15 @@ def cmd_check(cfg) -> int:
         print("Test request failed:", cfg.redact(str(exc)))
         return 2
     print(f"\nTest translation ({cfg.target_name}): {out.get(1)}")
+    if tr.fallback is not None:
+        try:
+            reply = tr.fallback.call(tr.build_prompt([(1, "The brown fox jumps over the lazy dog.")]), tr.system_prompt)
+            print(f"Backup model {cfg.fallback_model}: {tr.parse_response(reply).get(1)}")
+        except Exception as exc:  # noqa: BLE001
+            print("Backup model test failed:", cfg.redact(str(exc)))
+            return 2
+    else:
+        print("Backup model: not configured (FALLBACK_BASE_URL / FALLBACK_MODEL)")
     print("\nThe API cannot tell whether billing is enabled on the key's project. To stay free, check in")
     print("https://aistudio.google.com/ -> 'Usage & Billing' that the project shows 'Free tier' (no billing account).")
     return 0
@@ -94,6 +118,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="build work/<book>/glossary.txt with the model and stop, to review it first")
     ap.add_argument("--fix-names", action="store_true",
                     help="re-translate cached segments that break the glossary")
+    ap.add_argument("--bilingual", action="store_true",
+                    help="write <name>_<LANG>_bilingual.epub: each paragraph in the original, then translated")
+    ap.add_argument("--series", help="share the glossary with other books of this series ('none' to disable; "
+                                     "default: SERIES or the book's series metadata)")
+    ap.add_argument("--install-epubcheck", action="store_true",
+                    help="download W3C EPUBCheck into tools/ (needs Java) to validate every output")
+    ap.add_argument("--init", action="store_true",
+                    help="create .env, books-input/ and books-outputs/ in the current folder (EPUBLIA_HOME)")
+    ap.add_argument("--version", action="version", version=f"epublia {__version__}")
     ap.add_argument("--list", action="store_true", help="list matching books and exit")
     ap.add_argument("--check", action="store_true", help="verify API key/model with one tiny request")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -108,6 +141,32 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["TARGET_LANGUAGE"] = args.lang
     if args.model:
         os.environ["GEMINI_MODEL"] = args.model
+    if args.series:
+        os.environ["SERIES"] = args.series
+    if args.init:
+        from .config import ROOT
+        for d in ("books-input", "books-outputs"):
+            (ROOT / d).mkdir(parents=True, exist_ok=True)
+        env = ROOT / ".env"
+        if env.exists():
+            log.info("%s already exists; left untouched", env)
+        else:
+            env.write_text(ENV_TEMPLATE, encoding="utf-8")
+            log.info("Created %s: put your Gemini key in GEMINI_API_TOKEN, then run: epublia --check", env)
+        log.info("Copy your .epub files into %s", ROOT / "books-input")
+        return 0
+    if args.install_epubcheck:
+        from . import epubcheck
+        from .config import ROOT
+        try:
+            jar = epubcheck.install(ROOT)
+        except Exception as exc:  # noqa: BLE001
+            log.error("EPUBCheck download failed: %s", exc)
+            return 1
+        log.info("EPUBCheck installed: %s", jar)
+        if not epubcheck.find_java():
+            log.warning("Java was not found: install a Java 17+ runtime (e.g. https://adoptium.net) to use it")
+        return 0
     offline = args.extract_only or args.clean_only or args.dry_run
     needs_key = args.check or not (offline or args.list)
     try:
@@ -144,7 +203,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Model %s -> %s | throttle %d req/min%s", cfg.model, cfg.target_name, cfg.rpm,
                  f", {cfg.rpd} req/day" if cfg.rpd else "")
     clean = not args.no_clean and os.getenv("CLEANUP", "true").strip().lower() not in ("0", "false", "no", "off")
-    bt = BookTranslator(cfg, translator, use_cache=not args.no_cache, clean=clean, fix_names=args.fix_names)
+    bt = BookTranslator(cfg, translator, use_cache=not args.no_cache, clean=clean, fix_names=args.fix_names,
+                        bilingual=args.bilingual)
 
     failures = 0
     for book in books:

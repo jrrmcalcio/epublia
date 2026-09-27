@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epublia"
+dynamic = ["version"]
+description = "Translate EPUB books with Gemini (free tier friendly), changing only the text: layout, images, links and styles stay byte-identical."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "jrrmcalcio" }]
+keywords = ["epub", "ebook", "translation", "gemini", "llm", "bilingual", "calibre"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Text Processing :: Linguistic",
+]
+dependencies = [
+    "google-genai>=2.25",
+    "lxml>=6.0",
+    "python-dotenv>=1.2",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/jrrmcalcio/epublia"
+Issues = "https://github.com/jrrmcalcio/epublia/issues"
+
+[project.scripts]
+epublia = "epublia.cli:main"
+
+[tool.setuptools]
+packages = ["epublia"]
+
+[tool.setuptools.dynamic]
+version = { attr = "epublia.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

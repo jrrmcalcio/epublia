@@ -10,6 +10,7 @@ from google import genai
 from google.genai import errors, types
 
 from .config import Config
+from .fallback import FallbackError, OpenAICompatClient
 from .glossary import Glossary
 from .rate_limiter import DailyLimitReached, RateLimiter
 
@@ -80,6 +81,10 @@ Rules:
   PREVIOUS PASSAGE, already translated, only so you keep names, tone and forms of address
   consistent; never output it. Only output the marked segments after "SEGMENTS:"."""
 
+TITLE_PROMPT = """Give the title of this book as its published {language} edition shows it. If there is an
+established {language} title, use it; otherwise translate it naturally, keeping proper names and any
+series prefix in the form a {language} edition would use. Reply with the title only, on one line."""
+
 GLOSSARY_PROMPT = """You prepare the terminology sheet for a {language} translation of a book.
 You receive candidate terms extracted automatically, one per line: "term (count): example context".
 
@@ -113,6 +118,13 @@ class GeminiTranslator:
         )
         self.system_prompt = SYSTEM_PROMPT.format(language=cfg.target_name)
         self.requests_made = 0
+        self.fallback: OpenAICompatClient | None = None
+        self.fallback_used: list[str] = []  # source snippets the backup model translated
+        if cfg.fallback_enabled:
+            self.fallback = OpenAICompatClient(
+                cfg.fallback_base_url, cfg.fallback_api_key, cfg.fallback_model,
+                RateLimiter(cfg.fallback_rpm, cfg.fallback_rpd, cfg.work_dir / ".quota-fallback.json"),
+                temperature=cfg.temperature, redact=cfg.redact)
 
     # ------------------------------------------------------------------ API
 
@@ -265,11 +277,40 @@ class GeminiTranslator:
         i, text = item
         parts = split_text(text, len(text) // 2 + 1) if len(text) >= MIN_SPLIT else [text]
         if len(parts) < 2:
-            log.warning("segment %d could not be translated (%s); keeping original", i, reason)
-            return {i: text}
+            return self._fallback_single(item, glossary, context, reason)
         log.warning("segment %d failed (%s); retrying it in %d parts", i, reason, len(parts))
         got = self.translate_items(list(enumerate(parts, 1)), glossary, context)
         return {i: " ".join(got.get(n, p) for n, p in enumerate(parts, 1))}
+
+    def _fallback_single(self, item: tuple[int, str], glossary: Glossary | None,
+                         context: list[tuple[str, str]] | None, reason: str) -> dict[int, str]:
+        """Last resort for a passage Gemini will not translate: the backup provider, if configured."""
+        i, text = item
+        if self.fallback is not None:
+            block = glossary.prompt_block(text) if glossary else ""
+            try:
+                reply = self.fallback.call(self.build_prompt([item], block, context), self.system_prompt)
+                got = self.parse_response(reply).get(i)
+            except FallbackError as exc:
+                log.warning("segment %d: backup translator failed too (%s)", i, exc)
+                got = None
+            if got:
+                self.fallback_used.append(" ".join(_TAG.sub("", text).split())[:70])
+                log.info("segment %d translated by the backup model (%s)", i, reason)
+                return {i: got}
+        log.warning("segment %d could not be translated (%s); keeping original", i, reason)
+        return {i: text}
+
+    def translate_title(self, title: str, author: str = "") -> str:
+        """Book title as a published edition in the target language would print it."""
+        system = TITLE_PROMPT.format(language=self.cfg.target_name)
+        try:
+            reply = self.call(f"Title: {title}\nAuthor: {author}", system)
+        except TranslationError as exc:
+            log.warning("title not translated: %s", exc)
+            return title
+        line = next((ln.strip() for ln in reply.splitlines() if ln.strip()), "")
+        return line.strip('"“”«»*').removeprefix("Title:").strip() or title
 
     # ------------------------------------------------------------------ glossary
 

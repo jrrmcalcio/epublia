@@ -1,159 +1,299 @@
 # epublia
 
-Traduce libros EPUB con Gemini (free tier) conservando la estructura original: estilos, imágenes,
-portada, índice, ids, enlaces y formato inline (cursivas, negritas, saltos de línea). Solo cambia el texto.
+Translate EPUB books with Google Gemini (free tier friendly) while keeping everything but the
+words intact: styles, images, cover, table of contents, ids, links and inline formatting
+(italics, bold, line breaks). Only text nodes change; every other file in the book stays
+byte-identical, and that is verified on every run.
 
-## Instalación
+- **Consistent names across the whole book**: an automatic glossary, the previous passage sent as
+  context, a consistency report and `--fix-names` to repair only the segments that break it.
+- **Series support**: books of the same series share one glossary.
+- **Bilingual edition** on request (`--bilingual`): each paragraph in the original, then translated.
+- **Robust on messy books**: PDF-conversion artefacts are cleaned before translating, very long
+  paragraphs are sent in sentence-aligned parts, passages the model refuses are retried in halves
+  and, optionally, sent to a backup model (any OpenAI-compatible API).
+- **Checks its own output**: untranslated or incomplete passages, broken inline tags, structural
+  validation and, if Java is available, W3C EPUBCheck (only problems *added* by the translation are
+  reported).
+- **Free-tier aware**: client-side requests-per-minute and per-day limits, resumable per-chapter
+  cache, clean stop when the daily quota runs out.
+
+## Install
+
+From PyPI:
 
 ```bash
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt      # Windows
-# .venv/bin/pip install -r requirements.txt        # Linux / macOS
-copy .env.example .env                             # y rellena GEMINI_API_TOKEN
+pip install epublia
+mkdir my-books && cd my-books
+epublia --init            # creates .env, books-input/ and books-outputs/ here
 ```
 
-Verifica la key y el modelo (1 petición de prueba; muestra los modelos Flash disponibles):
+From source:
+
+```bash
+git clone https://github.com/jrrmcalcio/epublia && cd epublia
+python -m venv .venv
+.venv\Scripts\pip install -e .          # Windows
+# .venv/bin/pip install -e .            # Linux / macOS
+copy .env.example .env                  # then fill in GEMINI_API_TOKEN
+```
+
+Get a free Gemini key at <https://aistudio.google.com/apikey>. To stay free, create it in a
+Google Cloud project **without a billing account** (AI Studio → "Usage & Billing" must say
+"Free tier"). Then check the key and model (one small test request; lists the Flash models your
+key can use):
 
 ```bash
 epublia --check
 ```
 
-## Uso
+epublia looks for `.env`, `books-input/`, `books-outputs/` and `work/` in `EPUBLIA_HOME` if set,
+otherwise in the source checkout (when running from one) or the current folder.
 
-Copia tus `.epub` en `books-input/` y ejecuta con el nombre completo o solo una palabra:
+## Usage
+
+Copy your `.epub` files into `books-input/` and run with the full name or just a word of it:
 
 ```bash
-epublia firstborn                          # traduce todos los EPUB cuyo nombre contenga "firstborn"
-epublia "Firstborn_-_Christie_Golden.epub" # nombre exacto
-epublia christie golden                    # todas las palabras deben aparecer en el nombre
-epublia C:\ruta\a\libro.epub               # ruta directa
-epublia firstborn --list                   # solo muestra qué libros coinciden
-epublia firstborn --extract-only           # solo extrae los TXT por capítulo (sin API)
-epublia firstborn --clean-only             # solo limpia basura de PDF -> <nombre>_CLEAN.epub (sin API)
-epublia firstborn --no-clean               # traduce sin limpieza previa
-epublia firstborn --lang FR                # otro idioma sin tocar el .env
-epublia firstborn --no-cache               # vuelve a traducir todo
-epublia firstborn --dry-run                # qué se traduciría, cuántas peticiones y problemas de nombres (sin API)
-epublia firstborn --glossary-only          # genera el glosario del libro y para, para revisarlo antes
-epublia firstborn --fix-names              # retraduce solo los segmentos que no respetan el glosario
+epublia firstborn                          # every EPUB whose name contains "firstborn"
+epublia "Firstborn_-_Christie_Golden.epub" # exact name
+epublia christie golden                    # all words must appear in the name
+epublia C:\path\to\book.epub               # direct path
+epublia firstborn --list                   # only show which books match
+epublia firstborn --dry-run                # what would be translated, requests needed, name issues (no API)
+epublia firstborn --glossary-only          # build the book's glossary and stop, to review it first
+epublia firstborn --fix-names              # re-translate only segments that break the glossary
+epublia firstborn --bilingual              # bilingual edition -> <name>_<LANG>_bilingual.epub
+epublia firstborn --series StarCraft       # share the glossary with the other books of the series
+epublia firstborn --lang FR                # another language without editing .env
+epublia firstborn --extract-only           # only write the per-chapter TXT files (no API)
+epublia firstborn --clean-only             # only remove PDF artefacts -> <name>_CLEAN.epub (no API)
+epublia firstborn --no-clean               # translate without the PDF cleanup
+epublia firstborn --no-cache               # translate everything again
+epublia --install-epubcheck                # download W3C EPUBCheck into tools/ (needs Java)
 ```
 
-`epublia` es `.\epublia.bat` (PowerShell/cmd) o `./epublia.sh` (bash); también sirve
-`.venv\Scripts\python -m epublia`.
+In a source checkout without installing, `epublia` is `.\epublia.bat` (PowerShell/cmd),
+`./epublia.sh` (bash) or `python -m epublia`.
 
-Códigos de salida: `0` ok, `1` algún libro falló, `2` error de configuración, `3` cuota diaria agotada
-(el progreso queda guardado).
+The translation is written to `books-outputs/<name>_<LANG>.epub`.
 
-El libro traducido queda en `books-outputs/<nombre>_<IDIOMA>.epub`.
+Exit codes: `0` ok, `1` a book failed, `2` configuration error, `3` daily quota exhausted
+(progress is saved: run the same command again after the quota resets).
 
-## Cómo funciona
+Everything is automatic: a plain `epublia <book>` builds the glossary (if missing), translates,
+validates and writes the report in one run. The other options are for reviewing or repairing.
 
-1. Lee el EPUB (OPF, spine, manifest, NCX) y recorre cada documento XHTML en orden de lectura.
-2. Divide cada capítulo en segmentos (párrafos, títulos, texto suelto). El formato inline se
-   sustituye por marcadores `<x1>…</x1>` / `<x2/>` para que el modelo pueda moverlo con las palabras.
-3. **Limpia la basura de conversión PDF** (ver abajo) y registra cada cambio en `work/<libro>/cleanup.txt`.
-4. Escribe `work/<libro>/source/NNN_capitulo.txt` (con marcadores `[[n]]`) y `source-plain/` (texto limpio).
-5. Genera el **glosario** del libro la primera vez (ver [Coherencia de nombres](#coherencia-de-nombres)).
-6. Envía cada capítulo a Gemini (agrupando hasta `MAX_CHARS_PER_REQUEST` caracteres por petición),
-   con el glosario aplicable y el pasaje anterior como contexto, throttling de `GEMINI_RPM`
-   peticiones/minuto y reintentos con backoff ante 429/5xx. Los párrafos muy largos (típicos de
-   PDFs convertidos) se envían en trozos de hasta `SEGMENT_SPLIT_CHARS` cortados en fin de frase.
-   Si Gemini bloquea o se salta un segmento, se reintenta en mitades para que solo quede sin
-   traducir el fragmento problemático.
-7. Guarda la traducción en `work/<libro>/<idioma>/` (`translated/`, `translated-plain/` y una caché
-   por capítulo) que permite **reanudar** si se corta la conexión o se agota la cuota diaria. Cada
-   idioma tiene su propia caché y glosario.
-8. Reconstruye el EPUB copiando byte a byte todo lo que no es texto (imágenes, CSS, fuentes), cambia
-   `dc:language`, `xml:lang`, el índice (NCX) y da al libro un identificador nuevo para que el lector
-   no lo confunda con el original. Si el modelo olvida cerrar una etiqueta de formato, se cierra
-   donde terminaba en el original.
-9. Valida el resultado (XML bien formado, mismas imágenes/enlaces/tablas, recursos intactos) y genera
-   `work/<libro>/<idioma>/report.json` con segmentos sin traducir, **posiblemente incompletos**
-   (mucho más cortos que el original o con frases aún en el idioma original), problemas de nombres
-   y avisos de formato. Los dudosos se muestran también en la consola como `CHECK:`.
+## How it works
 
-## Limpieza de basura de PDF
+1. Reads the EPUB (OPF, spine, manifest, NCX) and walks every XHTML document in reading order.
+2. Splits each chapter into segments (paragraphs, headings, loose text). Inline markup becomes
+   placeholders `<x1>…</x1>` / `<x2/>` so the model can move it along with the words.
+3. **Cleans PDF-conversion artefacts** (see below) and logs every change in `work/<book>/cleanup.txt`.
+4. Writes `work/<book>/source/NNN_chapter.txt` (with `[[n]]` markers) and `source-plain/` (clean text).
+5. Builds the book's **glossary** the first time (see [Name consistency](#name-consistency)).
+6. Sends each chapter to Gemini (grouping up to `MAX_CHARS_PER_REQUEST` characters per request)
+   with the relevant glossary entries and the previous passage as context, throttled to
+   `GEMINI_RPM` requests/minute, with backoff on 429/5xx. Very long paragraphs (common in converted
+   PDFs) go out in sentence-aligned parts of up to `SEGMENT_SPLIT_CHARS`. If Gemini blocks or skips
+   a segment it is retried in halves, and whatever still fails goes to the backup model if one is
+   configured, so at most the offending passage stays untranslated.
+7. Stores the translation in `work/<book>/<lang>/` (`translated/`, `translated-plain/` and a
+   per-chapter cache), so a run can be **resumed** after a network error or an exhausted quota.
+   Each language has its own cache and glossary.
+8. Rebuilds the EPUB copying every non-text file byte for byte, sets `dc:language` and `xml:lang`,
+   translates the table of contents, title and description, and gives the book a new identifier so
+   reading apps don't confuse it with the original. If the model forgets to close an inline tag,
+   it is closed where the original element ended.
+9. Validates the result (well-formed XML, same images/links/tables, untouched resources, EPUBCheck
+   when available) and writes `work/<book>/<lang>/report.json` with untranslated or **possibly
+   incomplete** segments (much shorter than the source, or still containing source-language
+   sentences), name issues and formatting warnings. Doubtful ones are also printed as `CHECK:`.
 
-Muchos EPUB vienen de PDFs convertidos. Antes de traducir, epublia elimina o corrige:
+## Name consistency
 
-| Problema | Ejemplo | Acción |
-|---|---|---|
-| Encabezados/pies de página | `2 CHRISTIE GOLDEN`, `FIRSTBORN 3` | Se eliminan (título/autor + número, o línea numerada que se repite ≥3 veces) |
-| Encabezados repetidos en mayúsculas | `CHAPTER ONE` en cada página | Se eliminan si aparecen ≥5 veces a mitad de párrafo |
-| Números de página sueltos | `12`, `- 12 -`, `[12]`, `Page 12`, `12 of 300`, `xii` | Se eliminan (nunca en títulos `<h1>`…) |
-| Marcas de agua | `OceanofPDF.com`, "Scanned by…", "This page intentionally left blank" | Se eliminan |
-| Líneas cortadas a mitad de oración | `had done ⏎ to get inside` | Se unen |
-| Párrafos partidos | `</p><p>` seguido de minúscula | Se fusionan |
-| Palabras con guion de corte | `some- ⏎ thing`, `sepa- rate` | Se unen (respeta `pre- and post-war`) |
-| Ligaduras y caracteres invisibles | `ﬁ ﬂ ﬀ`, soft hyphen, zero-width | Se normalizan |
-| Letras espaciadas | `C H A P T E R` | Se unen |
-| Espacio antes de puntuación | `word ,` | Se corrige (respeta `. . .`) |
-| Notas al pie de PDF incrustadas | `1 See the appendix…` a mitad de párrafo | **Solo se reportan** en `cleanup.txt`: no se pueden distinguir con seguridad del texto |
+Chapters are translated in separate requests, so without help a model may write `Tigre Gris` in
+one chapter and `Gray Tiger` in the next. epublia prevents it in three ways:
 
-Las notas al pie reales de EPUB (enlaces/`noteref`) se conservan y se traducen. Revisa
-`work/<libro>/cleanup.txt` y, si quieres ver el resultado sin gastar cuota, usa `--clean-only`.
-Se desactiva con `--no-clean` o `CLEANUP=false`.
+1. **Automatic glossary.** Before translating, it finds the recurring proper names and invented
+   terms in the book (locally, no API) and asks the model how to render each one, in 1–2 requests.
+   The result is saved in `work/<book>/<lang>/glossary.txt`: edit it freely; it is never
+   regenerated while it exists (delete it to build a new one). The raw candidates are in
+   `work/<book>/glossary-candidates.txt`. Each request only carries the entries its text uses.
+2. **Context.** Each request includes the end of the previous passage, already translated
+   (`CONTEXT_CHARS`, 1500 by default; `0` disables it), to keep names, tone and forms of address.
+3. **Review.** After every run, `work/<book>/<lang>/names.txt` (and `report.json`) lists the
+   segments that break the glossary: a different rendering or inconsistent capitalisation
+   (`los shelak` vs `los Shelak`). `--fix-names` re-translates only those segments; if the new
+   version is worse (blocked, incomplete or with more issues), the old one is kept.
 
-## Free tier de Gemini
-
-- Los límites (peticiones/minuto y por día) dependen del modelo y la cuenta; consúltalos en
-  <https://aistudio.google.com/rate-limit>. Ajusta `GEMINI_RPM` a tu límite.
-- Si se agota la cuota **diaria**, epublia se detiene limpiamente (código 3) y al día siguiente
-  continúa donde quedó.
-- Para no pagar nunca: crea la key en un proyecto **sin cuenta de facturación**. Con facturación
-  activa, Google cobra por uso. La API no permite comprobarlo desde el código.
-- En el free tier Google puede usar el contenido enviado para mejorar sus productos.
-
-## Coherencia de nombres
-
-Cada capítulo se traduce en peticiones separadas, así que sin ayuda el modelo puede escribir
-`Tigre Gris` en un capítulo y `Gray Tiger` en otro. epublia lo evita de tres formas:
-
-1. **Glosario automático.** Antes de traducir, busca en el libro (sin API) los nombres propios y
-   términos inventados que se repiten y pide al modelo, en 1–2 peticiones, cómo traducir cada uno.
-   El resultado queda en `work/<libro>/<idioma>/glossary.txt`, editable, y no se regenera mientras exista
-   (bórralo para crear uno nuevo). Los candidatos brutos están en `glossary-candidates.txt`.
-   Cada petición incluye solo las entradas que aparecen en sus segmentos.
-2. **Contexto.** Cada petición lleva el final del pasaje anterior ya traducido (`CONTEXT_CHARS`,
-   1500 por defecto; `0` lo desactiva) para mantener nombres, tono y tratamientos (tú/usted).
-3. **Revisión.** Tras cada ejecución, `work/<libro>/<idioma>/names.txt` (y `report.json`) lista los segmentos
-   que no respetan el glosario: traducción distinta o mayúsculas incoherentes (`los shelak` frente
-   a `los Shelak`). `--fix-names` retraduce solo esos segmentos. Si la nueva versión sale peor
-   (bloqueada, incompleta o con más fallos), se conserva la anterior.
-
-Formato del glosario (una regla por línea, `#` para comentarios):
+Glossary format (one rule per line, `#` for comments):
 
 ```
 Gray Tiger = Tigre Gris
-Preserver = Preservador | Preservadora    # alternativas según género/número
+Preserver = Preservador | Preservadora    # alternatives for gender/number
 Shelak = Shelak
 ```
 
-Para reglas que valgan para todos tus libros, crea un archivo (ver `glossary.example.txt`) y
-apúntalo con `GLOSSARY_FILE=glossary.txt` en el `.env`: sus entradas prevalecen sobre las del
-glosario automático. `AUTO_GLOSSARY=false` desactiva la generación automática.
+For rules that apply to all your books, create a file (see `glossary.example.txt`) and point
+`GLOSSARY_FILE` at it in `.env`: its entries override the automatic glossary.
+`AUTO_GLOSSARY=false` turns the automatic glossary off.
 
-Todo es automático: `epublia libro` genera el glosario (si no existe) y traduce en una sola
-ejecución. Si prefieres revisar el glosario antes de gastar la cuota de la traducción:
-
-```bash
-epublia libro --dry-run          # coste estimado
-epublia libro --glossary-only    # 1–2 peticiones; revisa work/<libro>/<idioma>/glossary.txt
-epublia libro                    # traduce
-```
-
-Para un libro ya traducido: `--glossary-only`, revisa el glosario, `--dry-run --fix-names` para ver
-el coste y después `--fix-names`.
-
-## Limitaciones
-
-- EPUB con DRM no se pueden traducir (se detecta y se avisa).
-- No se traduce texto dentro de imágenes, SVG, `<pre>`/`<code>` ni el título en los metadatos.
-- La limpieza es heurística y conservadora: prefiere dejar un artefacto a borrar texto de la historia.
-
-## Tests
+Recommended flow if you want to review the glossary before spending quota on the translation:
 
 ```bash
-.venv\Scripts\pip install -r requirements-dev.txt
-.venv\Scripts\python -m pytest
+epublia book --dry-run          # estimated cost
+epublia book --glossary-only    # 1-2 requests; review work/<book>/<lang>/glossary.txt
+epublia book                    # translate
 ```
+
+For a book that is already translated: `--glossary-only`, review the glossary, then
+`--dry-run --fix-names` to see the cost and `--fix-names` to apply it.
+
+### Series
+
+Books of the same series share a glossary in `work/series/<series>/<lang>/glossary.txt`. When a new
+book of the series is translated, the terms already decided are copied into its glossary as they
+are (and not sent to the model again); after the translation, the book's glossary is merged back
+into the series one (the book's choices win, so your edits propagate to the next books).
+
+The series comes from `--series NAME`, the `SERIES` setting, or the book's own metadata
+(Calibre `calibre:series` or EPUB 3 `belongs-to-collection`). `--series none` disables it.
+
+## Bilingual edition
+
+`--bilingual` writes `books-outputs/<name>_<LANG>_bilingual.epub`, where every paragraph and
+heading appears first in the original language (slightly faded) and then translated. In list
+items, table cells and loose text, the original and the translation share the element, separated
+by a line break, so lists and tables keep their shape. Images, links and ids are not repeated, so
+the book stays valid and every link keeps a single target. It is only written on request and
+reuses the same cache: making a bilingual copy of an already translated book costs no requests.
+
+## Backup model
+
+Gemini occasionally refuses a passage (`PROHIBITED_CONTENT`), which its safety settings cannot
+switch off. epublia first retries it in smaller parts; what still fails can go to a backup model
+through any OpenAI-compatible chat-completions API. It is used only for those passages, which
+are listed under `translated_by_backup_model` in `report.json`.
+
+```ini
+FALLBACK_BASE_URL=https://openrouter.ai/api/v1
+FALLBACK_API_KEY=sk-or-...
+FALLBACK_MODEL=<model id>
+FALLBACK_RPM=10        # client-side throttle
+FALLBACK_RPD=0         # optional local daily cap
+```
+
+`epublia --check` sends one test request to the backup model too. Where to get a key (free tiers
+and model names change often; check the provider's page):
+
+| Provider | Key | Base URL | Cost |
+|---|---|---|---|
+| OpenRouter | <https://openrouter.ai/keys> | `https://openrouter.ai/api/v1` | Free models (ids ending in `:free`, list at <https://openrouter.ai/models?max_price=0>) with a small daily request limit |
+| Groq | <https://console.groq.com/keys> | `https://api.groq.com/openai/v1` | Free tier with rate limits (open models such as Llama) |
+| Mistral | <https://console.mistral.ai/api-keys> | `https://api.mistral.ai/v1` | Free "Experiment" plan with rate limits |
+| DeepSeek | <https://platform.deepseek.com/api_keys> | `https://api.deepseek.com` | Paid, very cheap per token |
+| Ollama (local) | none | `http://localhost:11434/v1` | Free, runs on your machine |
+
+OpenAI's API has no free tier.
+
+## Validation and EPUBCheck
+
+Every output is checked for a valid ZIP layout (`mimetype` first and uncompressed), well-formed
+XHTML, the same number of images, links, tables and SVGs as the original, and byte-identical
+non-text resources.
+
+If Java 17+ and [W3C EPUBCheck](https://github.com/w3c/epubcheck) are available, epublia also runs
+EPUBCheck on both the original and the translation and reports only the problems the translation
+added (many retail EPUBs already carry errors of their own). Setup:
+
+1. Install Java, e.g. Eclipse Temurin from <https://adoptium.net> (Windows:
+   `winget install EclipseAdoptium.Temurin.21.JRE`).
+2. `epublia --install-epubcheck` downloads the latest EPUBCheck into `tools/`.
+
+`EPUBCHECK_JAR` can point at another jar, or be `off` to skip the check.
+
+## PDF artefact cleanup
+
+Many EPUBs are converted PDFs. Before translating, epublia removes or fixes:
+
+| Problem | Example | Action |
+|---|---|---|
+| Running headers/footers | `2 CHRISTIE GOLDEN`, `FIRSTBORN 3` | Removed (title/author + number, or a numbered line repeated ≥3 times) |
+| Repeated all-caps headers | `CHAPTER ONE` on every page | Removed if seen ≥5 times mid-paragraph |
+| Stray page numbers | `12`, `- 12 -`, `[12]`, `Page 12`, `12 of 300`, `xii` | Removed (never in `<h1>`… headings) |
+| Watermarks | `OceanofPDF.com`, "Scanned by…", "This page intentionally left blank" | Removed |
+| Lines broken mid-sentence | `had done ⏎ to get inside` | Joined |
+| Split paragraphs | `</p><p>` followed by lowercase | Merged |
+| Words hyphenated at line end | `some- ⏎ thing`, `sepa- rate` | Joined (keeps `pre- and post-war`) |
+| Ligatures and invisible characters | `ﬁ ﬂ ﬀ`, soft hyphen, zero-width | Normalised |
+| Letter-spaced words | `C H A P T E R` | Joined |
+| Space before punctuation | `word ,` | Fixed (keeps `. . .`) |
+| Embedded PDF footnotes | `1 See the appendix…` mid-paragraph | **Only reported** in `cleanup.txt`: they cannot be told apart from story text reliably |
+
+Real EPUB footnotes (links/`noteref`) are kept and translated. Review `work/<book>/cleanup.txt`,
+and use `--clean-only` to see the result without spending quota. Disable with `--no-clean` or
+`CLEANUP=false`.
+
+## Gemini free tier
+
+- Limits (requests per minute and per day) depend on the model and account; see
+  <https://aistudio.google.com/rate-limit> and set `GEMINI_RPM` accordingly.
+- When the **daily** quota runs out, epublia stops cleanly (exit code 3) and continues where it
+  left off on the next run.
+- To never pay, create the key in a project **without a billing account**. With billing enabled,
+  Google charges per use. The API cannot tell which one you have.
+- On the free tier Google may use the submitted content to improve its products.
+
+## Configuration
+
+Settings are read from `.env` (see `.env.example` for a commented template):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `GEMINI_API_TOKEN` | — | Gemini API key (required) |
+| `TARGET_LANGUAGE` | `ES` | ISO code (`ES`, `FR`, `pt-br`…) or language name |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Model id; `epublia --check` lists yours |
+| `GEMINI_RPM` / `GEMINI_RPD` | `10` / `0` | Client-side requests per minute / per day (0 = no local daily cap) |
+| `MAX_CHARS_PER_REQUEST` | `24000` | Source characters per request |
+| `GEMINI_TEMPERATURE` | `0.3` | Sampling temperature |
+| `GEMINI_THINKING_LEVEL` | model default | `minimal`, `low`, `medium` or `high` |
+| `CLEANUP` | `true` | PDF artefact cleanup |
+| `GLOSSARY_FILE` | — | Global glossary that overrides the automatic one |
+| `AUTO_GLOSSARY` | `true` | Build the per-book glossary with the model |
+| `CONTEXT_CHARS` | `1500` | Previous translated text sent as context (0 = off) |
+| `SEGMENT_SPLIT_CHARS` | `6000` | Longer paragraphs are sent in sentence-aligned parts |
+| `SERIES` | book metadata | Series name for the shared glossary (`none` = off) |
+| `FALLBACK_BASE_URL` / `FALLBACK_API_KEY` / `FALLBACK_MODEL` | — | Backup model (OpenAI-compatible API) |
+| `FALLBACK_RPM` / `FALLBACK_RPD` | `10` / `0` | Backup model throttling |
+| `EPUBCHECK_JAR` | auto-detect | EPUBCheck jar path, or `off` |
+| `INPUT_DIR` / `OUTPUT_DIR` / `WORK_DIR` | `books-input` / `books-outputs` / `work` | Folders, relative to `EPUBLIA_HOME` |
+
+## Limitations
+
+- DRM-protected EPUBs cannot be translated (detected and reported).
+- Text inside images, SVG, `<pre>`/`<code>` and descriptions containing HTML is not translated.
+- The PDF cleanup is heuristic and conservative: it would rather leave an artefact than delete
+  story text.
+- Only translate books you are allowed to; `books-input/`, `books-outputs/` and `work/` are
+  git-ignored for that reason.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest -q
+```
+
+### Publishing
+
+Releases are published to PyPI by `.github/workflows/publish.yml` using PyPI trusted publishing
+(no token stored anywhere):
+
+1. Once, on <https://pypi.org/manage/account/publishing/>, add a pending publisher: project
+   `epublia`, owner `jrrmcalcio`, repository `epublia`, workflow `publish.yml`, environment `pypi`.
+2. Bump `__version__` in `epublia/__init__.py`, commit, then `git tag v0.2.0 && git push --tags`.
+
+## License
+
+MIT

@@ -111,15 +111,36 @@ class EpubPackage:
         el = self.opf.find(f".//{{{DC_NS}}}language")
         return (el.text or "").strip() if el is not None else ""
 
+    @property
+    def description(self) -> str:
+        el = self.opf.find(f".//{{{DC_NS}}}description")
+        return (el.text or "").strip() if el is not None else ""
+
+    @property
+    def series(self) -> str:
+        """Series name from Calibre (calibre:series) or EPUB 3 (belongs-to-collection) metadata."""
+        for meta in self.opf.iter(f"{{{OPF_NS}}}meta"):
+            if meta.get("name") == "calibre:series" and (meta.get("content") or "").strip():
+                return meta.get("content").strip()
+            if meta.get("property") == "belongs-to-collection" and (meta.text or "").strip():
+                return meta.text.strip()
+        return ""
+
     # ------------------------------------------------------------------ metadata rewrite
 
-    def translated_opf(self, lang: str, lang_name: str, model: str) -> tuple[bytes, str | None, str | None]:
+    def translated_opf(self, lang: str, lang_name: str, model: str, title: str | None = None,
+                       description: str | None = None) -> tuple[bytes, str | None, str | None]:
         """Return (opf_bytes, old_uid, new_uid). Sets dc:language, gives the translation its own
-        identifier (so reading apps don't merge it with the original) and records the translator."""
+        identifier (so reading apps don't merge it with the original), records the translator and,
+        when given, the translated title and description."""
         opf = etree.fromstring(etree.tostring(self.opf), _SAFE_PARSER)
         metadata = opf.find(f"{{{OPF_NS}}}metadata")
         if metadata is None:
             return etree.tostring(opf, xml_declaration=True, encoding="utf-8"), None, None
+        for tag, value in (("title", title), ("description", description)):
+            el = metadata.find(f"{{{DC_NS}}}{tag}")
+            if value and el is not None:
+                el.text = value
 
         langs = metadata.findall(f"{{{DC_NS}}}language")
         if langs:

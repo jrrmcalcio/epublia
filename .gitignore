@@ -27,3 +27,8 @@ __pycache__/
 Thumbs.db
 .vscode/
 .idea/
+
+# Tools and packaging
+tools/
+dist/
+build/

@@ -391,6 +391,78 @@ def apply_translation(seg: Segment, translated: str) -> list[str]:
     return warnings
 
 
+# Bilingual output: blocks whose original can sit next to them as a sibling of the same kind.
+_SIBLING_TAGS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "address", "center"}
+# Containers that accept block content but must not be duplicated (lists, tables): original goes inside.
+_FLOW_TAGS = {"li", "td", "th", "dd", "figcaption", "section", "article", "aside", "header", "footer", "nav"}
+# Parents where loose text's original may go in a <div>.
+_BLOCK_PARENTS = _FLOW_TAGS | {"body", "div", "blockquote", "center", "figure", "form", "fieldset", "main"}
+# Media and embedded content are not repeated in the original-language copy.
+_DROP_IN_COPY = {"img", "image", "svg", "video", "audio", "object", "embed", "iframe", "math", "picture"}
+ORIGINAL_STYLE = "opacity:0.7"
+
+
+def add_original(seg: Segment, source_text: str) -> None:
+    """Bilingual output: show ``source_text`` (the segment's source placeholders) next to the already
+    translated element. Paragraphs and headings get a sibling copy placed before them, loose text a
+    <div> before it; list items and table cells get a <div> inside (so lists and tables keep their
+    shape); inline-only containers get a <span> and a line break. The copy never repeats images, ids
+    or links, so the book stays valid and its links keep one target."""
+    el = seg.element
+    ns = el.tag[1:].split("}", 1)[0] if el.tag.startswith("{") else None
+
+    def q(name: str) -> str:
+        return f"{{{ns}}}{name}" if ns else name
+
+    tag = local(el.tag)
+    parent = el.getparent()
+    if tag == WRAPPER_TAG and (parent is None or local(parent.tag) not in _BLOCK_PARENTS):
+        tag = "span"  # loose text inside an inline element (malformed source): stay inline
+    if tag in _SIBLING_TAGS or tag == WRAPPER_TAG:
+        # Loose text sits in a block container (e.g. <body>) that only accepts blocks: use a <div>.
+        mode, holder = "sibling", etree.Element(el.tag if tag in _SIBLING_TAGS else q("div"))
+    elif tag in _FLOW_TAGS:
+        mode, holder = "inside", etree.Element(q("div"))
+    else:
+        mode, holder = "inline", etree.Element(q("span"))
+    if tag in _SIBLING_TAGS:
+        holder.attrib.update({k: v for k, v in el.attrib.items() if k != "id"})
+    holder.set("style", ";".join(s for s in (holder.get("style", "").rstrip(";"), ORIGINAL_STYLE) if s))
+    apply_translation(Segment(element=holder, text=source_text, refs=seg.refs, void_ids=seg.void_ids),
+                      source_text)
+    for node in list(holder.iter()):
+        if node is holder or not _is_element(node):
+            continue
+        tag = local(node.tag)
+        if tag in _DROP_IN_COPY:
+            parent = node.getparent()
+            prev = node.getprevious()
+            if node.tail:
+                if prev is not None:
+                    prev.tail = (prev.tail or "") + node.tail
+                else:
+                    parent.text = (parent.text or "") + node.tail
+            parent.remove(node)
+            continue
+        if tag == "a":
+            keep = {k: v for k, v in node.attrib.items() if k in ("class", "style")}
+            node.attrib.clear()
+            node.attrib.update(keep)
+            node.tag = q("span")
+        node.attrib.pop("id", None)
+    holder.tail = None
+    if mode == "sibling":
+        el.addprevious(holder)
+        return
+    holder.tail = el.text
+    el.text = None
+    el.insert(0, holder)
+    if mode == "inline":
+        br = etree.Element(q("br"))
+        br.tail, holder.tail = holder.tail, None
+        el.insert(1, br)
+
+
 def unwrap_runs(tree: etree._ElementTree) -> None:
     """Remove the temporary <epublia-run> wrappers, splicing their content back into the parent."""
     for w in list(tree.getroot().iter()):

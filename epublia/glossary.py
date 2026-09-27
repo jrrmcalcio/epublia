@@ -146,3 +146,18 @@ def find_candidates(texts: list[str], limit: int = 300) -> list[tuple[str, int, 
                     example[term] = " ".join(text[max(0, start - 70):start + len(term) + 70].split())
     ranked = [(t, n, example[t]) for t, n in total.most_common() if n >= 2 and mid[t] >= 1]
     return ranked[:limit]
+
+
+def merge(base_text: str, new_text: str) -> tuple[str, int, int]:
+    """Merge glossary ``new_text`` into ``base_text`` (new wins). Returns (rules text, added, changed)."""
+    merged = parse(base_text)
+    added = changed = 0
+    for key, entry in parse(new_text).items():
+        old = merged.get(key)
+        if old is None:
+            added += 1
+        elif old.renderings != entry.renderings:
+            changed += 1
+        merged[key] = entry
+    lines = [e.line for e in sorted(merged.values(), key=lambda e: e.source.lower())]
+    return "\n".join(lines), added, changed

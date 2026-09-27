@@ -9,7 +9,21 @@ from dotenv import load_dotenv
 
 from .languages import resolve_language
 
-ROOT = Path(__file__).resolve().parent.parent
+
+
+def _home() -> Path:
+    """Folder holding .env, books-input/, books-outputs/ and work/: EPUBLIA_HOME if set, the source
+    checkout when running from one (python -m epublia / pip install -e), else the current folder."""
+    env = os.getenv("EPUBLIA_HOME", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    checkout = Path(__file__).resolve().parent.parent
+    if (checkout / "pyproject.toml").exists() and (checkout / "epublia").is_dir():
+        return checkout
+    return Path.cwd()
+
+
+ROOT = _home()
 
 
 class ConfigError(Exception):
@@ -59,11 +73,23 @@ class Config:
     context_chars: int = 1500
     auto_glossary: bool = True
     segment_chars: int = 6000
+    fallback_base_url: str = ""
+    fallback_api_key: str = field(default="", repr=False)
+    fallback_model: str = ""
+    fallback_rpm: int = 10
+    fallback_rpd: int = 0
+    series: str = ""
+    epubcheck: str = ""  # path to epubcheck.jar ("" = auto-detect, "off" = disabled)
+
+    @property
+    def fallback_enabled(self) -> bool:
+        return bool(self.fallback_base_url and self.fallback_model)
 
     def redact(self, text: str) -> str:
-        """Remove the API key from any string before it is shown or logged."""
-        if self.api_key and self.api_key in text:
-            text = text.replace(self.api_key, "***")
+        """Remove the API keys from any string before it is shown or logged."""
+        for key in (self.api_key, self.fallback_api_key):
+            if key and key in text:
+                text = text.replace(key, "***")
         return text
 
 
@@ -106,4 +132,11 @@ def load_config(require_key: bool = True) -> Config:
         context_chars=max(0, _int("CONTEXT_CHARS", 1500)),
         segment_chars=max(1500, _int("SEGMENT_SPLIT_CHARS", 6000)),
         auto_glossary=os.getenv("AUTO_GLOSSARY", "true").strip().lower() not in ("0", "false", "no", "off"),
+        fallback_base_url=os.getenv("FALLBACK_BASE_URL", "").strip(),
+        fallback_api_key=os.getenv("FALLBACK_API_KEY", "").strip().strip('"').strip("'"),
+        fallback_model=os.getenv("FALLBACK_MODEL", "").strip(),
+        fallback_rpm=max(1, _int("FALLBACK_RPM", 10)),
+        fallback_rpd=max(0, _int("FALLBACK_RPD", 0)),
+        series=os.getenv("SERIES", "").strip(),
+        epubcheck=os.getenv("EPUBCHECK_JAR", "").strip(),
     )
