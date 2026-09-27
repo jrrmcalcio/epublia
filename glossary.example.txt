@@ -1,0 +1,5 @@
+# One rule per line. Lines starting with # are ignored by the model as comments.
+Protoss = Protoss
+Zerg = Zerg
+Terran Dominion = Dominio Terran
+Xel'Naga = Xel'Naga

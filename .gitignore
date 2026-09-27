@@ -1,0 +1,29 @@
+# Secrets & local AI notes
+.env
+.env.*
+!.env.example
+CLAUDE.md
+.claude/
+
+# Books (copyrighted material) and intermediate files
+books-input/*
+!books-input/.gitkeep
+books-outputs/*
+!books-outputs/.gitkeep
+work/
+*.epub
+glossary*.txt
+!glossary.example.txt
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
